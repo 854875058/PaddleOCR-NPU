@@ -851,7 +851,7 @@ class MultiProcessOCRPool:
         idle_timeout: int = 120,
         scale_cooldown: int = 15,
         batch_acquire_wait: float = 8.0,
-        instance_hbm_mb: int = 20000,
+        instance_hbm_mb: int = 8000,
         hbm_safety_margin_mb: int = 4096,
         result_timeout: float = 300.0,
         monitor_interval: float = 3.0,
@@ -1190,25 +1190,35 @@ class MultiProcessOCRPool:
         排序键 (能容纳, -已分配, order, -free_mb)：
           - 已分配多的优先（填满当前卡，避免分散）
           - 必须 assigned < per_card_max
-          - 若 npu-smi 取得到 hbm，必须 free_mb >= instance_hbm_mb + safety_margin
+          - 必须 npu-smi 取得到 hbm 且 free_mb >= instance_hbm_mb + safety_margin
+            （取不到 hbm 视为"不确定是否被外部占用"，保守拒绝扩容，避免 OOM）
         """
         hbm_status = self._query_npu_hbm_status()
+        if not hbm_status:
+            print(f"[pool] scale-up declined: npu-smi gave no HBM info; refusing to risk OOM",
+                  flush=True)
+            return None
+
         candidates = []
+        rejected_reasons = []
         for order, device_id in enumerate(self.npu_device_ids):
             assigned = self._assigned_count(device_id)
             if assigned >= self.per_card_max:
+                rejected_reasons.append(f"npu:{device_id}(per_card_max={self.per_card_max} reached)")
                 continue
-            if device_id in hbm_status:
-                free_mb = hbm_status[device_id]['free_mb']
-                can_fit = free_mb >= (self.instance_hbm_mb + self.hbm_safety_margin_mb)
-                if not can_fit:
-                    continue
-                score = (-assigned, order, -free_mb)
-            else:
-                # 取不到 HBM 时按优先级兜底
-                score = (-assigned, order, 0)
+            if device_id not in hbm_status:
+                rejected_reasons.append(f"npu:{device_id}(no hbm info)")
+                continue
+            free_mb = hbm_status[device_id]['free_mb']
+            need_mb = self.instance_hbm_mb + self.hbm_safety_margin_mb
+            if free_mb < need_mb:
+                rejected_reasons.append(f"npu:{device_id}(free={free_mb}MB < need={need_mb}MB)")
+                continue
+            score = (-assigned, order, -free_mb)
             candidates.append((score, device_id))
         if not candidates:
+            if rejected_reasons:
+                print(f"[pool] scale-up declined: {'; '.join(rejected_reasons)}", flush=True)
             return None
         candidates.sort()
         return candidates[0][1]
