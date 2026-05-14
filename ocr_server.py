@@ -755,14 +755,9 @@ def ocr_worker_main(
 ):
     """子进程入口。所有 torch_npu / PaddleOCR 触碰都发生在这里。
 
-    参数（顶层函数 + 仅 picklable 类型，可被 mp.spawn 启动）:
-      worker_id          字符串 id（父进程指派，便于日志）
-      device_id          NPU 设备号
-      task_q / result_q  共享 mp.Queue，单向通信
-      ready_event        mp.Event，模型加载完毕后由 worker 自己 set
-      busy_state         mp.Value('b')，0=idle 1=busy，父进程读用于负载判断
-      last_used_state    mp.Value('d')，最近一次完成任务的 wall-clock，父进程读用于缩容
-      ocr_kwargs         传给 OCRServer 的 dict（不含 npu_device_id，函数内拼）
+    注意：每个 worker 拥有 *自己的* task_q（私有队列），父进程的 dispatcher
+    只把任务投给当前 idle 的 worker。这避免了"新启动 worker 还在 init 时
+    抢到任务"导致请求等到模型加载完才被处理的问题。
     """
     try:
         kwargs = dict(ocr_kwargs)
@@ -878,7 +873,8 @@ class MultiProcessOCRPool:
         self.request_count = 0
         self.error_count = 0
         self._mp_ctx = mp.get_context('spawn')
-        self.task_q = self._mp_ctx.Queue()
+        # 注意：result_q 共享，但 task_q 改为每 worker 独占（在 _spawn_worker 里创建）。
+        # 这避免了"新启动 worker 还在 init 时抢到队列里的任务"导致延迟尖刺。
         self.result_q = self._mp_ctx.Queue()
         self.workers: List[Dict] = []
         self.pending: Dict[str, Dict] = {}
@@ -972,25 +968,23 @@ class MultiProcessOCRPool:
                 'idle_instance_count': len(idle_workers),
                 'pending_instance_count': sum(1 for w in self.workers if not w['ready']),
                 'instances_per_device': per_device,
-                'task_queue_size': self._safe_qsize(self.task_q),
+                'task_queue_size': self._total_queued_tasks(),
             }
 
     def shutdown(self, wait_timeout: float = 5.0):
         if self._shutdown:
             return
         self._shutdown = True
-        # 给每个 worker 投 sentinel
-        with self._workers_lock:
-            n_workers = len(self.workers)
-        for _ in range(n_workers):
-            try:
-                self.task_q.put(None, timeout=1.0)
-            except Exception:
-                break
-        # 等 worker 退出
-        deadline = time.time() + wait_timeout
+        # 给每个 worker 投 sentinel 到它自己的 task_q
         with self._workers_lock:
             workers_snapshot = list(self.workers)
+        for w in workers_snapshot:
+            try:
+                w['task_q'].put(None, timeout=1.0)
+            except Exception:
+                pass
+        # 等 worker 退出
+        deadline = time.time() + wait_timeout
         for w in workers_snapshot:
             remaining = max(0.1, deadline - time.time())
             try:
@@ -1006,34 +1000,46 @@ class MultiProcessOCRPool:
     # --------- 内部 ---------
 
     def _dispatch(self, method: str, args: Dict) -> Dict:
-        """投任务进 task_q，按 req_id 等结果回来。"""
+        """选一个 ready 且 inflight 最少的 worker 派单，按 req_id 等结果回来。
+
+        关键：不再用单一全局 task_q。每个 worker 有自己的 task_q，dispatcher
+        显式选择目标 worker。这样新 spawn 的 worker 在 init 完成前不会被
+        派任务，避免延迟尖刺。
+        """
         self.request_count += 1
         if self._shutdown:
             self.error_count += 1
             return {'success': False, 'error': 'pool is shutting down'}
 
-        # 至少要有一个 ready worker，否则原地等一小段时间
-        if not self._has_ready_worker(wait_seconds=self.batch_acquire_wait):
+        # 选 ready worker（如果都 busy，选 inflight 最小的；至多等 batch_acquire_wait）
+        worker = self._pick_target_worker(wait_seconds=self.batch_acquire_wait)
+        if worker is None:
             self.error_count += 1
             return {'success': False, 'error': 'no ready OCR worker available'}
 
         req_id = uuid.uuid4().hex
         ev = threading.Event()
-        slot = {'event': ev, 'msg': None}
+        slot = {'event': ev, 'msg': None, 'worker': worker}
         with self._pending_lock:
             self.pending[req_id] = slot
 
         try:
-            self.task_q.put({'id': req_id, 'method': method, 'args': args})
+            with self._workers_lock:
+                worker['inflight'] = worker.get('inflight', 0) + 1
+            worker['task_q'].put({'id': req_id, 'method': method, 'args': args})
         except Exception as exc:
             with self._pending_lock:
                 self.pending.pop(req_id, None)
+            with self._workers_lock:
+                worker['inflight'] = max(0, worker.get('inflight', 0) - 1)
             self.error_count += 1
             return {'success': False, 'error': f'failed to enqueue task: {exc!r}'}
 
         if not ev.wait(timeout=self.result_timeout):
             with self._pending_lock:
                 self.pending.pop(req_id, None)
+            with self._workers_lock:
+                worker['inflight'] = max(0, worker.get('inflight', 0) - 1)
             self.error_count += 1
             return {'success': False, 'error': f'timed out after {self.result_timeout}s'}
 
@@ -1044,8 +1050,28 @@ class MultiProcessOCRPool:
             return {'success': False, 'error': err}
         return msg['payload']
 
+    def _pick_target_worker(self, wait_seconds: float = 0.0) -> Optional[Dict]:
+        """挑一个最适合派单的 ready worker：优先 idle，其次 inflight 最少。"""
+        deadline = time.time() + wait_seconds
+        while True:
+            with self._workers_lock:
+                ready = [w for w in self.workers
+                         if w['ready'] and not w.get('retiring', False)]
+                if ready:
+                    # 优先 busy_state==0 且 inflight==0 的
+                    idle = [w for w in ready
+                            if w['busy_state'].value == 0 and w.get('inflight', 0) == 0]
+                    if idle:
+                        return min(idle, key=lambda x: x['last_used_state'].value)
+                    # 退一步：选 inflight 最少的（让新请求至少入队最空闲那个）
+                    return min(ready, key=lambda x: (x.get('inflight', 0),
+                                                     x['busy_state'].value))
+            if time.time() >= deadline:
+                return None
+            time.sleep(0.1)
+
     def _result_demux_loop(self):
-        """单线程读 result_q，按 req_id 路由到 pending 等待者。"""
+        """单线程读 result_q，按 req_id 路由到 pending 等待者，并回收 inflight。"""
         while not self._shutdown:
             try:
                 msg = self.result_q.get(timeout=0.5)
@@ -1062,13 +1088,29 @@ class MultiProcessOCRPool:
 
             with self._pending_lock:
                 slot = self.pending.pop(req_id, None)
-            if slot is None:
-                continue  # 调用方已经超时放弃
-            slot['msg'] = msg
-            slot['event'].set()
+            # 不论是否还有调用方在等结果，都要把 worker 的 inflight 计数还回去
+            if slot is not None:
+                worker = slot.get('worker')
+                if worker is not None:
+                    with self._workers_lock:
+                        worker['inflight'] = max(0, worker.get('inflight', 0) - 1)
+                slot['msg'] = msg
+                slot['event'].set()
+            else:
+                # 调用方已经超时放弃了，仍要校正 inflight
+                worker_id = msg.get('worker_id')
+                if worker_id:
+                    with self._workers_lock:
+                        for w in self.workers:
+                            if w['worker_id'] == worker_id:
+                                w['inflight'] = max(0, w.get('inflight', 0) - 1)
+                                break
 
     def _spawn_worker(self, device_id: int) -> Dict:
-        """spawn 一个新 worker 进程。返回 worker dict（未必 ready）。"""
+        """spawn 一个新 worker 进程。返回 worker dict（未必 ready）。
+
+        每个 worker 拥有自己的 task_q（私有），父进程仅向当前 idle worker 派单。
+        """
         with self._workers_lock:
             self._worker_seq += 1
             worker_id = f"ocr-w{self._worker_seq}-npu{device_id}"
@@ -1076,11 +1118,12 @@ class MultiProcessOCRPool:
         ready_event = self._mp_ctx.Event()
         busy_state = self._mp_ctx.Value('b', 0)
         last_used_state = self._mp_ctx.Value('d', time.time())
+        task_q = self._mp_ctx.Queue()
 
         process = self._mp_ctx.Process(
             target=ocr_worker_main,
             name=worker_id,
-            args=(worker_id, device_id, self.task_q, self.result_q,
+            args=(worker_id, device_id, task_q, self.result_q,
                   ready_event, busy_state, last_used_state, self.ocr_kwargs),
             daemon=True,
         )
@@ -1089,12 +1132,14 @@ class MultiProcessOCRPool:
             'worker_id': worker_id,
             'device_id': device_id,
             'process': process,
+            'task_q': task_q,
             'ready_event': ready_event,
             'busy_state': busy_state,
             'last_used_state': last_used_state,
             'ready': False,
             'retiring': False,
             'spawned_at': time.time(),
+            'inflight': 0,  # dispatcher 派出但 worker 尚未回报的任务计数
         }
         with self._workers_lock:
             self.workers.append(worker)
@@ -1140,6 +1185,18 @@ class MultiProcessOCRPool:
             return q.qsize()
         except (NotImplementedError, OSError):
             return -1
+
+    def _total_queued_tasks(self) -> int:
+        """跨所有 worker 的真实排队任务总数（仅 mp.Queue 中尚未被取走的）。"""
+        total = 0
+        with self._workers_lock:
+            for w in self.workers:
+                if w.get('retiring', False):
+                    continue
+                qs = self._safe_qsize(w['task_q'])
+                if qs > 0:
+                    total += qs
+        return total
 
     # --------- 扩缩容（C3） ---------
 
@@ -1244,8 +1301,8 @@ class MultiProcessOCRPool:
         # 间隔内连续触发，否则单 worker init 慢时其它请求会被卡住。
         if (time.time() - self._last_scale_up) < self.scale_cooldown:
             return False
-        # 触发条件：有积压 或 所有就绪 worker 都在忙
-        qsize = self._safe_qsize(self.task_q)
+        # 触发条件：有积压（任一 worker 队列里有等单的）或 所有就绪 worker 都在忙
+        qsize = self._total_queued_tasks()
         has_pressure = (qsize and qsize > 0) or (ready > 0 and busy == ready)
         if not has_pressure:
             return False
@@ -1302,9 +1359,9 @@ class MultiProcessOCRPool:
         print(f"[pool] scale down: retiring worker {target['worker_id']} (npu:{target['device_id']})", flush=True)
         with self._workers_lock:
             target['retiring'] = True
-        # 投一个 None sentinel，target worker 会接住它退出
+        # 投 sentinel 到目标 worker 自己的 task_q
         try:
-            self.task_q.put(None, timeout=1.0)
+            target['task_q'].put(None, timeout=1.0)
         except Exception:
             pass
         # 异步等它真的死掉再从 workers 列表里清除
