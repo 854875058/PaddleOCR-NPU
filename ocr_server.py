@@ -889,7 +889,12 @@ class MultiProcessOCRPool:
 
         self.request_count = 0
         self.error_count = 0
-        self._mp_ctx = mp.get_context('spawn')
+        # 关键：默认 'spawn' context 会在父进程里 fork helper，干扰 FastAPI 的 asyncio
+        # event loop（症状是 uvicorn 不再 accept 新连接）。'forkserver' 把 fork 委托给
+        # 独立的 forkserver 进程，主进程 asyncio 不受影响。
+        # 用环境变量 OCR_MP_CONTEXT 覆盖默认（spawn / fork / forkserver）。
+        _mp_ctx_name = os.getenv('OCR_MP_CONTEXT', 'forkserver').strip().lower() or 'forkserver'
+        self._mp_ctx = mp.get_context(_mp_ctx_name)
         # 注意：result_q 共享，但 task_q 改为每 worker 独占（在 _spawn_worker 里创建）。
         # 这避免了"新启动 worker 还在 init 时抢到队列里的任务"导致延迟尖刺。
         self.result_q = self._mp_ctx.Queue()
