@@ -522,12 +522,17 @@ class ElasticOCRPool:
                     self._idle_instances(),
                     key=lambda item: (item['last_used'], item['instance_id'])
                 )
+                # 即使能拿到目标数量，但若所有实例都 busy（含本次拿走的），
+                # 顺手触发一次扩容，让下次请求能用上更多实例
                 if len(idle_instances) >= target_count:
                     acquired = idle_instances[:target_count]
                     now = time.time()
                     for item in acquired:
                         item['busy'] = True
                         item['last_used'] = now
+                    # 拿走后还剩 <=0 个 idle 且总实例 < max → 趁机扩
+                    if len(idle_instances) <= target_count:
+                        self._maybe_scale_up_locked()
                     return acquired
 
                 self._maybe_scale_up_locked()
