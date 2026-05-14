@@ -1644,15 +1644,28 @@ async def startup_event():
             ocr_server = None
             return
 
-        # 关键：MultiProcessOCRPool.__init__ 同步等 worker init 50s+，
-        # 不能阻塞 asyncio event loop（uvicorn handler 全卡死）。
-        # 用 run_in_executor 把它丢到线程池里。
-        import asyncio as _asyncio
-        loop = _asyncio.get_event_loop()
-        ocr_server = await loop.run_in_executor(
-            None,
-            lambda: MultiProcessOCRPool(**elastic_config, **ocr_config),
-        )
+        # 紧急回滚开关：OCR_USE_LEGACY_POOL=true 用旧的 ElasticOCRPool（同进程多线程）。
+        # MultiProcessOCRPool 在当前环境下会破坏 FastAPI 的 asyncio event loop（症状是
+        # uvicorn 不再 accept 新连接），原因疑似 multiprocessing context 在父进程留下的
+        # helper 进程/socket。新池根因未定位前，先用旧池保证发版可用。
+        _use_legacy = os.getenv('OCR_USE_LEGACY_POOL', 'true').lower() == 'true'
+        if _use_legacy:
+            print("ℹ️  using legacy ElasticOCRPool (same-process multi-thread). "
+                  "Set OCR_USE_LEGACY_POOL=false to try MultiProcessOCRPool.")
+            elastic_legacy_config = {
+                k: v for k, v in elastic_config.items()
+                if k not in ('per_card_max', 'monitor_interval', 'worker_init_timeout')
+            }
+            ocr_server = ElasticOCRPool(**elastic_legacy_config, **ocr_config)
+        else:
+            # 关键：MultiProcessOCRPool.__init__ 同步等 worker init 50s+，
+            # 不能阻塞 asyncio event loop。用 run_in_executor 把它丢到线程池里。
+            import asyncio as _asyncio
+            loop = _asyncio.get_event_loop()
+            ocr_server = await loop.run_in_executor(
+                None,
+                lambda: MultiProcessOCRPool(**elastic_config, **ocr_config),
+            )
 
         cls_status = "启用" if use_angle_cls else "禁用"
         per_card_str = elastic_config['per_card_max'] if elastic_config['per_card_max'] > 0 else "unlimited"
