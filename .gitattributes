@@ -1,1 +1,12 @@
 *.pth filter=lfs diff=lfs merge=lfs -text
+
+# Force LF in working tree on all platforms (Linux deployment target).
+# Without this, Windows checkouts produce CRLF and bash on Linux fails with
+# "'\r': command not found" when running shell scripts.
+*.py text eol=lf
+*.sh text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.txt text eol=lf
+*.md text eol=lf
+*.json text eol=lf
