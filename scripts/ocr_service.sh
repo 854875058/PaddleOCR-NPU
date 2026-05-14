@@ -1,8 +1,23 @@
 #!/usr/bin/env bash
+# Re-exec under bash when invoked via `sh` / `dash` (avoids "Illegal option -o pipefail").
+if [ -z "${BASH_VERSION:-}" ]; then
+  exec bash "$0" "$@"
+fi
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Locate the project root by finding start_server.py near the script.
+# Works whether the script is placed at <root>/scripts/ocr_service.sh or directly at <root>/ocr_service.sh.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -f "$SCRIPT_DIR/start_server.py" ]; then
+  ROOT_DIR="$SCRIPT_DIR"
+elif [ -f "$SCRIPT_DIR/../start_server.py" ]; then
+  ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+else
+  echo "ERROR: cannot locate start_server.py near $SCRIPT_DIR" >&2
+  exit 1
+fi
 cd "$ROOT_DIR"
+export PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}"
 
 CMD="${1:-start}"
 if [ $# -gt 0 ]; then
