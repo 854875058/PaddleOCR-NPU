@@ -29,11 +29,12 @@ PORT="${PORT:-6663}"
 PHYSICAL_NPU_DEVICE_IDS="${PHYSICAL_NPU_DEVICE_IDS:-0,1,2,3}"
 SERVICE_LOCAL_NPU_DEVICE_IDS="${SERVICE_LOCAL_NPU_DEVICE_IDS:-1,2,3}"
 MIN_INSTANCES="${MIN_INSTANCES:-1}"
-MAX_INSTANCES="${MAX_INSTANCES:-3}"
+MAX_INSTANCES="${MAX_INSTANCES:-32}"
+PER_CARD_MAX="${PER_CARD_MAX:-0}"
 IDLE_TIMEOUT="${IDLE_TIMEOUT:-120}"
 SCALE_COOLDOWN="${SCALE_COOLDOWN:-20}"
 BATCH_ACQUIRE_WAIT="${BATCH_ACQUIRE_WAIT:-6}"
-INSTANCE_HBM_MB="${INSTANCE_HBM_MB:-20000}"
+INSTANCE_HBM_MB="${INSTANCE_HBM_MB:-8000}"
 HBM_SAFETY_MARGIN_MB="${HBM_SAFETY_MARGIN_MB:-6144}"
 LOG_DIR="${LOG_DIR:-$ROOT_DIR/logs}"
 LOG_FILE="${LOG_FILE:-$LOG_DIR/ocr_service.log}"
@@ -215,6 +216,7 @@ start_service() {
   echo "  ASCEND_RT_VISIBLE_DEVICES=$ASCEND_RT_VISIBLE_DEVICES"
   echo "  min_instances=$MIN_INSTANCES"
   echo "  max_instances=$MAX_INSTANCES"
+  echo "  per_card_max=$PER_CARD_MAX  (0 = unlimited; rely on HBM only)"
   echo "  idle_timeout=$IDLE_TIMEOUT"
   echo "  scale_cooldown=$SCALE_COOLDOWN"
   echo "  batch_acquire_wait=$BATCH_ACQUIRE_WAIT"
@@ -230,6 +232,7 @@ start_service() {
     --npu_device_id "$primary_id" \
     --min_instances "$MIN_INSTANCES" \
     --max_instances "$MAX_INSTANCES" \
+    --per_card_max "$PER_CARD_MAX" \
     --idle_timeout "$IDLE_TIMEOUT" \
     --scale_cooldown "$SCALE_COOLDOWN" \
     --batch_acquire_wait "$BATCH_ACQUIRE_WAIT" \
