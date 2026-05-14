@@ -1329,9 +1329,11 @@ class MultiProcessOCRPool:
                 pass
 
     def _monitor_loop(self):
-        """每 monitor_interval 秒检查一次负载，触发扩/缩容。"""
+        """每 monitor_interval 秒检查一次负载，触发扩/缩容/死进程清理。"""
         while not self._shutdown:
             try:
+                self._reap_dead_workers()    # C5: 清理已死的 worker
+                self._respawn_to_min()       # C5: 死掉后实例数若低于 min 自动补
                 if self._should_scale_up():
                     self._scale_up_one()
                 else:
@@ -1343,6 +1345,44 @@ class MultiProcessOCRPool:
                 if self._shutdown:
                     return
                 time.sleep(0.1)
+
+    # --------- C5 watchdog ---------
+
+    def _reap_dead_workers(self):
+        """检测进程已退出但还在 self.workers 列表里的项，清理。"""
+        with self._workers_lock:
+            dead = [w for w in self.workers
+                    if not w.get('retiring', False) and not w['process'].is_alive()]
+        for w in dead:
+            print(f"[pool] watchdog: worker {w['worker_id']} (pid={w['process'].pid}) "
+                  f"died unexpectedly, cleaning up", flush=True)
+            with self._workers_lock:
+                try:
+                    self.workers.remove(w)
+                except ValueError:
+                    pass
+
+    def _respawn_to_min(self):
+        """死掉后 ready+pending 总数低于 min_instances 时补回去。"""
+        if self._shutdown:
+            return
+        ready, busy, idle, pending, total = self._busy_ready_idle_counts()
+        deficit = self.min_instances - (total + pending)
+        if deficit <= 0:
+            return
+        for _ in range(deficit):
+            device_id = self._pick_device_for_scale_up()
+            if device_id is None:
+                return
+            print(f"[pool] watchdog: respawning to reach min_instances={self.min_instances}, "
+                  f"target=npu:{device_id}", flush=True)
+            worker = self._spawn_worker(device_id)
+            threading.Thread(
+                target=self._wait_for_workers_ready,
+                args=([worker], self.worker_init_timeout),
+                name=f"ocr-respawn-wait-{worker['worker_id']}",
+                daemon=True,
+            ).start()
 
 
 ocr_server = None
@@ -1431,22 +1471,29 @@ async def startup_event():
         elastic_config = {
             'npu_device_ids': npu_device_ids,
             'min_instances': int(os.getenv('OCR_MIN_INSTANCES', '1')),
-            'max_instances': int(os.getenv('OCR_MAX_INSTANCES', '3')),
+            'max_instances': int(os.getenv('OCR_MAX_INSTANCES', '9')),
+            'per_card_max': int(os.getenv('OCR_PER_CARD_MAX', '3')),
             'idle_timeout': int(os.getenv('OCR_IDLE_TIMEOUT', '120')),
             'scale_cooldown': int(os.getenv('OCR_SCALE_COOLDOWN', '15')),
             'batch_acquire_wait': float(os.getenv('OCR_BATCH_ACQUIRE_WAIT', '8')),
-            'instance_hbm_mb': int(os.getenv('OCR_INSTANCE_HBM_MB', '20000')),
+            'instance_hbm_mb': int(os.getenv('OCR_INSTANCE_HBM_MB', '8000')),
             'hbm_safety_margin_mb': int(os.getenv('OCR_HBM_SAFETY_MARGIN_MB', '4096')),
+            'monitor_interval': float(os.getenv('OCR_MONITOR_INTERVAL', '3.0')),
+            'worker_init_timeout': float(os.getenv('OCR_WORKER_INIT_TIMEOUT', '300.0')),
         }
 
-        ocr_server = ElasticOCRPool(**elastic_config, **ocr_config)
-        
+        # 使用多进程池：每实例一个独立 OS 进程，支持同卡多实例 + 动态扩缩容
+        ocr_server = MultiProcessOCRPool(**elastic_config, **ocr_config)
+
         cls_status = "启用" if use_angle_cls else "禁用"
         print(f"OCR推理服务启动成功")
         print(f"  - 设备: {ocr_server.device_info}")
         print(f"  - 文本方向分类: {cls_status}")
         print(f"  - Batch配置: 分类=24, 识别=12 (优化模式)")
-        print(f"  - Elastic: min={elastic_config['min_instances']}, max={elastic_config['max_instances']}, batch_wait={elastic_config['batch_acquire_wait']}s")
+        print(f"  - Pool: min={elastic_config['min_instances']}, max={elastic_config['max_instances']}, "
+              f"per_card_max={elastic_config['per_card_max']}, "
+              f"instance_hbm_mb={elastic_config['instance_hbm_mb']}, "
+              f"safety_margin_mb={elastic_config['hbm_safety_margin_mb']}")
         
     except Exception as e:
         print(f"OCR推理服务启动失败: {e}")

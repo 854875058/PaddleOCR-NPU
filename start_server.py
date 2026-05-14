@@ -24,12 +24,15 @@ def parse_args():
     parser.add_argument("--npu_device_id", type=int, default=1, help="NPU设备ID")
     parser.add_argument("--npu_device_ids", type=str, default="1,2,3", help="NPU设备优先级列表，逗号分隔，如 1,2,3")
     parser.add_argument("--min_instances", type=int, default=1, help="最小常驻实例数")
-    parser.add_argument("--max_instances", type=int, default=3, help="实例池最大实例数")
+    parser.add_argument("--max_instances", type=int, default=9, help="实例池最大实例数（默认每卡3实例×3卡=9）")
+    parser.add_argument("--per_card_max", type=int, default=3, help="单张NPU卡上允许的最大实例数")
     parser.add_argument("--idle_timeout", type=int, default=120, help="实例空闲多久后自动缩容，单位秒")
     parser.add_argument("--scale_cooldown", type=int, default=15, help="扩容冷却时间，单位秒")
     parser.add_argument("--batch_acquire_wait", type=float, default=8.0, help="批量请求为等待新实例就绪而额外等待的秒数")
-    parser.add_argument("--instance_hbm_mb", type=int, default=20000, help="估算单个OCR实例占用的HBM，单位MB")
+    parser.add_argument("--instance_hbm_mb", type=int, default=8000, help="估算单个OCR实例占用的HBM，单位MB")
     parser.add_argument("--hbm_safety_margin_mb", type=int, default=4096, help="每张卡保留的HBM安全余量，单位MB")
+    parser.add_argument("--monitor_interval", type=float, default=3.0, help="弹性伸缩监控间隔（秒）")
+    parser.add_argument("--worker_init_timeout", type=float, default=300.0, help="单个 worker 初始化超时（秒）")
     
     # 模型路径配置
     parser.add_argument("--det_model_path", type=str, default="./models/ptocr_v5_server_det.pth", help="检测模型路径")
@@ -113,7 +116,7 @@ def print_startup_info(args):
     print(f"  - 处理模式: 同步处理 (简化架构)")
     print(f"  - 计算设备: NPU 弹性实例池")
     print(f"  - 设备优先级: {args.npu_device_ids}")
-    print(f"  - Elastic: min={args.min_instances}, max={args.max_instances}, batch_wait={args.batch_acquire_wait}s")
+    print(f"  - Elastic: min={args.min_instances}, max={args.max_instances}, per_card_max={args.per_card_max}, batch_wait={args.batch_acquire_wait}s")
     print(f"  - 文本方向分类: {'启用' if use_angle_cls else '禁用'}")
     if use_angle_cls:
         print(f"  - 分类模型: {args.cls_model_path}")
@@ -137,11 +140,14 @@ def main():
     os.environ['OCR_NPU_DEVICE_IDS'] = str(args.npu_device_ids)
     os.environ['OCR_MIN_INSTANCES'] = str(args.min_instances)
     os.environ['OCR_MAX_INSTANCES'] = str(args.max_instances)
+    os.environ['OCR_PER_CARD_MAX'] = str(args.per_card_max)
     os.environ['OCR_IDLE_TIMEOUT'] = str(args.idle_timeout)
     os.environ['OCR_SCALE_COOLDOWN'] = str(args.scale_cooldown)
     os.environ['OCR_BATCH_ACQUIRE_WAIT'] = str(args.batch_acquire_wait)
     os.environ['OCR_INSTANCE_HBM_MB'] = str(args.instance_hbm_mb)
     os.environ['OCR_HBM_SAFETY_MARGIN_MB'] = str(args.hbm_safety_margin_mb)
+    os.environ['OCR_MONITOR_INTERVAL'] = str(args.monitor_interval)
+    os.environ['OCR_WORKER_INIT_TIMEOUT'] = str(args.worker_init_timeout)
     
     # 模型路径配置
     os.environ['OCR_DET_MODEL_PATH'] = args.det_model_path
