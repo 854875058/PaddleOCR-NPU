@@ -1627,7 +1627,16 @@ async def startup_event():
         # 使用多进程池：每实例一个独立 OS 进程，支持同卡多实例 + 动态扩缩容
         if os.getenv('OCR_SKIP_WARMUP', 'false').lower() == 'true':
             ocr_config['skip_warmup'] = True
-        ocr_server = MultiProcessOCRPool(**elastic_config, **ocr_config)
+
+        # 关键：MultiProcessOCRPool.__init__ 同步等 worker init 50s+，
+        # 不能阻塞 asyncio event loop（uvicorn handler 全卡死）。
+        # 用 run_in_executor 把它丢到线程池里。
+        import asyncio as _asyncio
+        loop = _asyncio.get_event_loop()
+        ocr_server = await loop.run_in_executor(
+            None,
+            lambda: MultiProcessOCRPool(**elastic_config, **ocr_config),
+        )
 
         cls_status = "启用" if use_angle_cls else "禁用"
         per_card_str = elastic_config['per_card_max'] if elastic_config['per_card_max'] > 0 else "unlimited"
