@@ -24,7 +24,7 @@ def _emit(prefix, *parts):
     print(line, flush=True)
 
 
-def _child_run(worker_idx: int, device_id: int, n_iters: int, ev_q, done_q):
+def _child_run(worker_idx: int, device_id: int, n_iters: int, ev_q, go_q, done_q):
     """每一步显式回报，方便父进程定位 worker 卡在哪一步。"""
     try:
         _emit(f"w{worker_idx}", "M0_started")
@@ -51,10 +51,10 @@ def _child_run(worker_idx: int, device_id: int, n_iters: int, ev_q, done_q):
         _emit(f"w{worker_idx}", f"M5_warmup_done {warmup_t:.2f}s")
         ev_q.put(("M5_warmup_done", worker_idx, os.getpid(), warmup_t))
 
-        # 等父进程 go
+        # 等父进程 go（独立 go_q，避免读回自己的 marker）
         _emit(f"w{worker_idx}", "M6_waiting_go")
         ev_q.put(("M6_waiting_go", worker_idx, os.getpid()))
-        signal = ev_q.get()
+        signal = go_q.get()
         if signal != ("go",):
             done_q.put(("err", worker_idx, os.getpid(), f"unexpected signal {signal}"))
             return
@@ -102,11 +102,12 @@ def _drain_events(ev_qs, expected_marker: str, timeout_per_q: float):
 def _run_processes(n_workers: int, device_id: int, n_iters: int):
     ctx = mp.get_context("spawn")
     ev_qs = [ctx.Queue() for _ in range(n_workers)]
+    go_qs = [ctx.Queue() for _ in range(n_workers)]
     done_qs = [ctx.Queue() for _ in range(n_workers)]
     procs = [
         ctx.Process(
             target=_child_run,
-            args=(i, device_id, n_iters, ev_qs[i], done_qs[i]),
+            args=(i, device_id, n_iters, ev_qs[i], go_qs[i], done_qs[i]),
         )
         for i in range(n_workers)
     ]
@@ -130,7 +131,7 @@ def _run_processes(n_workers: int, device_id: int, n_iters: int):
         sys.exit(2)
 
     print("--- all workers warmup done. sending go for steady-state inference ---", flush=True)
-    for q in ev_qs:
+    for q in go_qs:
         q.put(("go",))
 
     timings = []
