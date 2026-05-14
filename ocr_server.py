@@ -1107,6 +1107,9 @@ class MultiProcessOCRPool:
             if w['ready_event'].wait(timeout=remaining):
                 w['ready'] = True
                 ready.append(w)
+                # ready 状态变化打印一行，便于观察扩容是否生效
+                ready_count = sum(1 for x in self.workers if x['ready'])
+                print(f"[pool] worker {w['worker_id']} ready (now ready_count={ready_count})", flush=True)
             else:
                 print(f"[pool] worker {w['worker_id']} init timeout after {timeout}s", flush=True)
         return ready
@@ -1225,8 +1228,9 @@ class MultiProcessOCRPool:
         ready, busy, idle, pending, total = self._busy_ready_idle_counts()
         if total + pending >= self.max_instances:
             return False
-        if pending > 0:
-            return False  # 已经在扩容中
+        # 扩容冷却：避免 monitor loop 每个 tick 都疯狂 spawn。
+        # 注意不要因 pending>0 一票否决——同卡多实例可并行加载，应允许在 cooldown
+        # 间隔内连续触发，否则单 worker init 慢时其它请求会被卡住。
         if (time.time() - self._last_scale_up) < self.scale_cooldown:
             return False
         # 触发条件：有积压 或 所有就绪 worker 都在忙
