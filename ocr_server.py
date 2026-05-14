@@ -10,6 +10,8 @@ import sys
 import time
 import traceback
 import threading
+import multiprocessing as mp
+import queue as _queue
 import subprocess
 import re
 import logging
@@ -728,6 +730,404 @@ class ElasticOCRPool:
                 'instances_per_device': per_device,
                 'npu_hbm_status': self._query_npu_hbm_status(),
             }
+
+
+# ============================================================
+#  MultiProcessOCRPool —— 多进程 worker 池（支持单卡多实例 + 动态扩缩容）
+# ============================================================
+#
+# 设计要点见 plan: silly-greeting-whale.md
+# - 每个 OCR 实例 = 一个独立 OS 进程，绕开同进程多线程下的 OCRServer.lock 串行
+# - 父进程不 import torch_npu / 不加载模型，所有 NPU 触碰只发生在 worker 子进程
+# - task_q/result_q 各一根，请求按 req_id demux 路由回 dispatcher
+# - 当前实现：dispatch + demux 主体（C1+C2）；扩缩容 monitor 线程见 C3
+
+
+def ocr_worker_main(
+    worker_id: str,
+    device_id: int,
+    task_q,
+    result_q,
+    ready_event,
+    busy_state,
+    last_used_state,
+    ocr_kwargs: dict,
+):
+    """子进程入口。所有 torch_npu / PaddleOCR 触碰都发生在这里。
+
+    参数（顶层函数 + 仅 picklable 类型，可被 mp.spawn 启动）:
+      worker_id          字符串 id（父进程指派，便于日志）
+      device_id          NPU 设备号
+      task_q / result_q  共享 mp.Queue，单向通信
+      ready_event        mp.Event，模型加载完毕后由 worker 自己 set
+      busy_state         mp.Value('b')，0=idle 1=busy，父进程读用于负载判断
+      last_used_state    mp.Value('d')，最近一次完成任务的 wall-clock，父进程读用于缩容
+      ocr_kwargs         传给 OCRServer 的 dict（不含 npu_device_id，函数内拼）
+    """
+    try:
+        kwargs = dict(ocr_kwargs)
+        kwargs['npu_device_id'] = device_id
+        # 关键：OCRServer 实例化挪到子进程，父进程不再创建
+        server = OCRServer(use_npu=True, **kwargs)
+        ready_event.set()
+    except Exception as exc:
+        # init 失败时通过 result_q 报一次，父进程能感知到 worker 死掉
+        try:
+            result_q.put({
+                'id': '__init_failed__',
+                'ok': False,
+                'error': f'worker {worker_id} init failed: {exc!r}',
+                'worker_id': worker_id,
+                'device_id': device_id,
+            })
+        except Exception:
+            pass
+        return
+
+    while True:
+        try:
+            task = task_q.get()
+        except (KeyboardInterrupt, SystemExit):
+            return
+        if task is None:
+            # 优雅退出 sentinel
+            return
+
+        req_id = task['id']
+        method = task['method']
+        args = task['args']
+
+        with busy_state.get_lock():
+            busy_state.value = 1
+        try:
+            if method == 'single':
+                payload = server.process_single_image(**args)
+            elif method == 'batch':
+                payload = server.process_batch_images(**args)
+            else:
+                payload = {'success': False, 'error': f'unknown method {method!r}'}
+            result_q.put({
+                'id': req_id,
+                'ok': True,
+                'payload': payload,
+                'worker_id': worker_id,
+                'device_id': device_id,
+            })
+        except Exception as exc:
+            result_q.put({
+                'id': req_id,
+                'ok': False,
+                'error': repr(exc),
+                'worker_id': worker_id,
+                'device_id': device_id,
+            })
+        finally:
+            with busy_state.get_lock():
+                busy_state.value = 0
+            with last_used_state.get_lock():
+                last_used_state.value = time.time()
+
+
+class MultiProcessOCRPool:
+    """多进程 OCR 实例池：每实例独占 OS 进程，支持同卡多实例 + 动态扩缩容。
+
+    本类的接口契约与 ElasticOCRPool 保持一致，可在 startup_event 里平替：
+      - process_single_image(image_base64, format_output, slice_params) -> Dict
+      - process_batch_images(images, format_output, use_optimized) -> Dict
+      - device_info: str  (property)
+      - request_count / error_count: int 属性
+      - get_pool_stats() -> Dict
+      - shutdown(wait_timeout: float = 5.0)
+
+    扩缩容 monitor 线程见后续 C3 实现，当前版本仅启动 min_instances 个 worker。
+    """
+
+    def __init__(
+        self,
+        npu_device_ids: List[int],
+        min_instances: int = 1,
+        max_instances: int = 9,
+        per_card_max: int = 3,
+        idle_timeout: int = 120,
+        scale_cooldown: int = 15,
+        batch_acquire_wait: float = 8.0,
+        instance_hbm_mb: int = 20000,
+        hbm_safety_margin_mb: int = 4096,
+        result_timeout: float = 300.0,
+        monitor_interval: float = 3.0,
+        worker_init_timeout: float = 240.0,
+        **ocr_kwargs,
+    ):
+        self.npu_device_ids = list(dict.fromkeys(npu_device_ids or [ocr_kwargs.get('npu_device_id', 0)]))
+        self.min_instances = max(1, min_instances)
+        self.max_instances = max(self.min_instances, max_instances)
+        self.per_card_max = max(1, per_card_max)
+        self.idle_timeout = max(10, idle_timeout)
+        self.scale_cooldown = max(0, scale_cooldown)
+        self.batch_acquire_wait = max(0.0, batch_acquire_wait)
+        self.instance_hbm_mb = max(1024, instance_hbm_mb)
+        self.hbm_safety_margin_mb = max(0, hbm_safety_margin_mb)
+        self.result_timeout = max(10.0, result_timeout)
+        self.monitor_interval = max(1.0, monitor_interval)
+        self.worker_init_timeout = max(30.0, worker_init_timeout)
+        self.ocr_kwargs = dict(ocr_kwargs)
+        # 父进程不能持有 npu_device_id，避免误用
+        self.ocr_kwargs.pop('npu_device_id', None)
+
+        self.request_count = 0
+        self.error_count = 0
+        self._mp_ctx = mp.get_context('spawn')
+        self.task_q = self._mp_ctx.Queue()
+        self.result_q = self._mp_ctx.Queue()
+        self.workers: List[Dict] = []
+        self.pending: Dict[str, Dict] = {}
+        self._workers_lock = threading.Lock()
+        self._pending_lock = threading.Lock()
+        self._shutdown = False
+        self._worker_seq = 0
+        self._last_scale_up = 0.0
+
+        # 启动 demux 线程（必须在 spawn worker 之前，避免 worker init 失败信号丢失）
+        self._demux_thread = threading.Thread(
+            target=self._result_demux_loop,
+            name='ocr-result-demux',
+            daemon=True,
+        )
+        self._demux_thread.start()
+
+        # 同步起 min_instances 个 worker
+        primary_devices = self._initial_device_round_robin(self.min_instances)
+        for device_id in primary_devices:
+            self._spawn_worker(device_id)
+        self._wait_for_workers_ready(self.workers, self.worker_init_timeout)
+
+    # --------- 公共接口（契约保持） ---------
+
+    @property
+    def device_info(self) -> str:
+        with self._workers_lock:
+            ready = [w for w in self.workers if w['ready'] and not w.get('retiring', False)]
+            if not ready:
+                return "unknown"
+            counts: Dict[int, int] = {}
+            for w in ready:
+                counts[w['device_id']] = counts.get(w['device_id'], 0) + 1
+            parts = [f"NPU-{d}x{n}" for d, n in sorted(counts.items())]
+            return ",".join(parts)
+
+    def process_single_image(self, image_base64: str, format_output: bool = True,
+                             slice_params: Optional[Dict] = None) -> Dict:
+        return self._dispatch('single', dict(
+            image_base64=image_base64,
+            format_output=format_output,
+            slice_params=slice_params,
+        ))
+
+    def process_batch_images(self, images: List[str], format_output: bool = True,
+                             use_optimized: bool = True) -> Dict:
+        if not images:
+            return {
+                'success': True,
+                'results': [],
+                'processing_time': 0.0,
+                'image_count': 0,
+                'total_text_count': 0,
+                'method_used': 'optimized' if use_optimized else 'traditional',
+                'format_output': format_output,
+                'device_ids': [],
+            }
+        return self._dispatch('batch', dict(
+            images=images,
+            format_output=format_output,
+            use_optimized=use_optimized,
+        ))
+
+    def get_pool_stats(self) -> Dict:
+        with self._workers_lock:
+            ready_workers = [w for w in self.workers if w['ready']]
+            busy_workers = [w for w in ready_workers if w['busy_state'].value != 0]
+            idle_workers = [w for w in ready_workers if w['busy_state'].value == 0]
+            per_device: Dict[str, int] = {}
+            for w in ready_workers:
+                key = str(w['device_id'])
+                per_device[key] = per_device.get(key, 0) + 1
+            return {
+                'min_instances': self.min_instances,
+                'max_instances': self.max_instances,
+                'per_card_max': self.per_card_max,
+                'configured_device_ids': self.npu_device_ids,
+                'instance_hbm_mb': self.instance_hbm_mb,
+                'hbm_safety_margin_mb': self.hbm_safety_margin_mb,
+                'ready_instance_count': len(ready_workers),
+                'busy_instance_count': len(busy_workers),
+                'idle_instance_count': len(idle_workers),
+                'pending_instance_count': sum(1 for w in self.workers if not w['ready']),
+                'instances_per_device': per_device,
+                'task_queue_size': self._safe_qsize(self.task_q),
+            }
+
+    def shutdown(self, wait_timeout: float = 5.0):
+        if self._shutdown:
+            return
+        self._shutdown = True
+        # 给每个 worker 投 sentinel
+        with self._workers_lock:
+            n_workers = len(self.workers)
+        for _ in range(n_workers):
+            try:
+                self.task_q.put(None, timeout=1.0)
+            except Exception:
+                break
+        # 等 worker 退出
+        deadline = time.time() + wait_timeout
+        with self._workers_lock:
+            workers_snapshot = list(self.workers)
+        for w in workers_snapshot:
+            remaining = max(0.1, deadline - time.time())
+            try:
+                w['process'].join(timeout=remaining)
+            except Exception:
+                pass
+            if w['process'].is_alive():
+                try:
+                    w['process'].kill()
+                except Exception:
+                    pass
+
+    # --------- 内部 ---------
+
+    def _dispatch(self, method: str, args: Dict) -> Dict:
+        """投任务进 task_q，按 req_id 等结果回来。"""
+        self.request_count += 1
+        if self._shutdown:
+            self.error_count += 1
+            return {'success': False, 'error': 'pool is shutting down'}
+
+        # 至少要有一个 ready worker，否则原地等一小段时间
+        if not self._has_ready_worker(wait_seconds=self.batch_acquire_wait):
+            self.error_count += 1
+            return {'success': False, 'error': 'no ready OCR worker available'}
+
+        req_id = uuid.uuid4().hex
+        ev = threading.Event()
+        slot = {'event': ev, 'msg': None}
+        with self._pending_lock:
+            self.pending[req_id] = slot
+
+        try:
+            self.task_q.put({'id': req_id, 'method': method, 'args': args})
+        except Exception as exc:
+            with self._pending_lock:
+                self.pending.pop(req_id, None)
+            self.error_count += 1
+            return {'success': False, 'error': f'failed to enqueue task: {exc!r}'}
+
+        if not ev.wait(timeout=self.result_timeout):
+            with self._pending_lock:
+                self.pending.pop(req_id, None)
+            self.error_count += 1
+            return {'success': False, 'error': f'timed out after {self.result_timeout}s'}
+
+        msg = slot['msg']
+        if msg is None or not msg.get('ok'):
+            self.error_count += 1
+            err = msg.get('error') if msg else 'no result'
+            return {'success': False, 'error': err}
+        return msg['payload']
+
+    def _result_demux_loop(self):
+        """单线程读 result_q，按 req_id 路由到 pending 等待者。"""
+        while not self._shutdown:
+            try:
+                msg = self.result_q.get(timeout=0.5)
+            except _queue.Empty:
+                continue
+            except Exception:
+                continue
+
+            req_id = msg.get('id')
+            if req_id == '__init_failed__':
+                # worker init 失败，标记并打印；后续 monitor 再决定是否重启
+                print(f"[pool] worker init failed: {msg.get('error')}", flush=True)
+                continue
+
+            with self._pending_lock:
+                slot = self.pending.pop(req_id, None)
+            if slot is None:
+                continue  # 调用方已经超时放弃
+            slot['msg'] = msg
+            slot['event'].set()
+
+    def _spawn_worker(self, device_id: int) -> Dict:
+        """spawn 一个新 worker 进程。返回 worker dict（未必 ready）。"""
+        with self._workers_lock:
+            self._worker_seq += 1
+            worker_id = f"ocr-w{self._worker_seq}-npu{device_id}"
+
+        ready_event = self._mp_ctx.Event()
+        busy_state = self._mp_ctx.Value('b', 0)
+        last_used_state = self._mp_ctx.Value('d', time.time())
+
+        process = self._mp_ctx.Process(
+            target=ocr_worker_main,
+            name=worker_id,
+            args=(worker_id, device_id, self.task_q, self.result_q,
+                  ready_event, busy_state, last_used_state, self.ocr_kwargs),
+            daemon=True,
+        )
+        process.start()
+        worker = {
+            'worker_id': worker_id,
+            'device_id': device_id,
+            'process': process,
+            'ready_event': ready_event,
+            'busy_state': busy_state,
+            'last_used_state': last_used_state,
+            'ready': False,
+            'retiring': False,
+            'spawned_at': time.time(),
+        }
+        with self._workers_lock:
+            self.workers.append(worker)
+        return worker
+
+    def _wait_for_workers_ready(self, workers: List[Dict], timeout: float) -> List[Dict]:
+        deadline = time.time() + timeout
+        ready: List[Dict] = []
+        for w in workers:
+            remaining = max(0.0, deadline - time.time())
+            if w['ready_event'].wait(timeout=remaining):
+                w['ready'] = True
+                ready.append(w)
+            else:
+                print(f"[pool] worker {w['worker_id']} init timeout after {timeout}s", flush=True)
+        return ready
+
+    def _has_ready_worker(self, wait_seconds: float = 0.0) -> bool:
+        deadline = time.time() + wait_seconds
+        while True:
+            with self._workers_lock:
+                if any(w['ready'] and not w.get('retiring', False) for w in self.workers):
+                    return True
+            if time.time() >= deadline:
+                return False
+            time.sleep(0.2)
+
+    def _initial_device_round_robin(self, n: int) -> List[int]:
+        """min_instances 初始分布：每张卡轮转，避免初始全堆在卡 0。"""
+        if not self.npu_device_ids:
+            return []
+        result = []
+        for i in range(n):
+            result.append(self.npu_device_ids[i % len(self.npu_device_ids)])
+        return result
+
+    @staticmethod
+    def _safe_qsize(q) -> int:
+        try:
+            return q.qsize()
+        except (NotImplementedError, OSError):
+            return -1
 
 
 ocr_server = None
