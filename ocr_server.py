@@ -907,12 +907,15 @@ class MultiProcessOCRPool:
         self._last_scale_up = 0.0
 
         # 启动 demux 线程（必须在 spawn worker 之前，避免 worker init 失败信号丢失）
-        self._demux_thread = threading.Thread(
-            target=self._result_demux_loop,
-            name='ocr-result-demux',
-            daemon=True,
-        )
-        self._demux_thread.start()
+        # 调试用：OCR_DEBUG_NO_THREADS=true 不启动 demux + monitor，验证是否是它们破坏 event loop
+        _no_threads = os.getenv('OCR_DEBUG_NO_THREADS', 'false').lower() == 'true'
+        if not _no_threads:
+            self._demux_thread = threading.Thread(
+                target=self._result_demux_loop,
+                name='ocr-result-demux',
+                daemon=True,
+            )
+            self._demux_thread.start()
 
         # 同步起 min_instances 个 worker
         primary_devices = self._initial_device_round_robin(self.min_instances)
@@ -921,12 +924,13 @@ class MultiProcessOCRPool:
         self._wait_for_workers_ready(self.workers, self.worker_init_timeout)
 
         # 启动 monitor 线程（C3）：周期性检查负载，扩/缩容
-        self._monitor_thread = threading.Thread(
-            target=self._monitor_loop,
-            name='ocr-pool-monitor',
-            daemon=True,
-        )
-        self._monitor_thread.start()
+        if not _no_threads:
+            self._monitor_thread = threading.Thread(
+                target=self._monitor_loop,
+                name='ocr-pool-monitor',
+                daemon=True,
+            )
+            self._monitor_thread.start()
 
     # --------- 公共接口（契约保持） ---------
 
