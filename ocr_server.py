@@ -846,8 +846,8 @@ class MultiProcessOCRPool:
         self,
         npu_device_ids: List[int],
         min_instances: int = 1,
-        max_instances: int = 9,
-        per_card_max: int = 3,
+        max_instances: int = 32,
+        per_card_max: int = 0,
         idle_timeout: int = 120,
         scale_cooldown: int = 15,
         batch_acquire_wait: float = 8.0,
@@ -861,7 +861,8 @@ class MultiProcessOCRPool:
         self.npu_device_ids = list(dict.fromkeys(npu_device_ids or [ocr_kwargs.get('npu_device_id', 0)]))
         self.min_instances = max(1, min_instances)
         self.max_instances = max(self.min_instances, max_instances)
-        self.per_card_max = max(1, per_card_max)
+        # per_card_max <= 0 表示不限制（仅靠 hbm 自然限制）
+        self.per_card_max = per_card_max if per_card_max > 0 else 0
         self.idle_timeout = max(10, idle_timeout)
         self.scale_cooldown = max(0, scale_cooldown)
         self.batch_acquire_wait = max(0.0, batch_acquire_wait)
@@ -1189,7 +1190,7 @@ class MultiProcessOCRPool:
 
         排序键 (能容纳, -已分配, order, -free_mb)：
           - 已分配多的优先（填满当前卡，避免分散）
-          - 必须 assigned < per_card_max
+          - per_card_max > 0 时必须 assigned < per_card_max；per_card_max <= 0 表示不限制
           - 必须 npu-smi 取得到 hbm 且 free_mb >= instance_hbm_mb + safety_margin
             （取不到 hbm 视为"不确定是否被外部占用"，保守拒绝扩容，避免 OOM）
         """
@@ -1203,7 +1204,7 @@ class MultiProcessOCRPool:
         rejected_reasons = []
         for order, device_id in enumerate(self.npu_device_ids):
             assigned = self._assigned_count(device_id)
-            if assigned >= self.per_card_max:
+            if self.per_card_max > 0 and assigned >= self.per_card_max:
                 rejected_reasons.append(f"npu:{device_id}(per_card_max={self.per_card_max} reached)")
                 continue
             if device_id not in hbm_status:
@@ -1471,8 +1472,8 @@ async def startup_event():
         elastic_config = {
             'npu_device_ids': npu_device_ids,
             'min_instances': int(os.getenv('OCR_MIN_INSTANCES', '1')),
-            'max_instances': int(os.getenv('OCR_MAX_INSTANCES', '9')),
-            'per_card_max': int(os.getenv('OCR_PER_CARD_MAX', '3')),
+            'max_instances': int(os.getenv('OCR_MAX_INSTANCES', '32')),
+            'per_card_max': int(os.getenv('OCR_PER_CARD_MAX', '0')),
             'idle_timeout': int(os.getenv('OCR_IDLE_TIMEOUT', '120')),
             'scale_cooldown': int(os.getenv('OCR_SCALE_COOLDOWN', '15')),
             'batch_acquire_wait': float(os.getenv('OCR_BATCH_ACQUIRE_WAIT', '8')),
@@ -1486,12 +1487,13 @@ async def startup_event():
         ocr_server = MultiProcessOCRPool(**elastic_config, **ocr_config)
 
         cls_status = "启用" if use_angle_cls else "禁用"
+        per_card_str = elastic_config['per_card_max'] if elastic_config['per_card_max'] > 0 else "unlimited"
         print(f"OCR推理服务启动成功")
         print(f"  - 设备: {ocr_server.device_info}")
         print(f"  - 文本方向分类: {cls_status}")
         print(f"  - Batch配置: 分类=24, 识别=12 (优化模式)")
         print(f"  - Pool: min={elastic_config['min_instances']}, max={elastic_config['max_instances']}, "
-              f"per_card_max={elastic_config['per_card_max']}, "
+              f"per_card_max={per_card_str}, "
               f"instance_hbm_mb={elastic_config['instance_hbm_mb']}, "
               f"safety_margin_mb={elastic_config['hbm_safety_margin_mb']}")
         
