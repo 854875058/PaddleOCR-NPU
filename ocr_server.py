@@ -12,6 +12,7 @@ import traceback
 import threading
 import subprocess
 import re
+import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Optional, Union
 import base64
@@ -29,6 +30,19 @@ import cv2
 
 # 导入OCR模块
 from pytorch_paddle import PytorchPaddleOCR, create_ocr
+
+
+class _AccessLogProbeFilter(logging.Filter):
+    """过滤 uvicorn access 日志中的 /health 和 /info 探针请求，避免淹没真错误。"""
+
+    _PATHS = ('/health', '/info')
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+        except Exception:
+            return True
+        return not any(f' {p}' in msg or f' {p}?' in msg for p in self._PATHS)
 
 
 class OCRRequest(BaseModel):
@@ -552,9 +566,13 @@ class ElasticOCRPool:
             self._release_instances([instance])
 
     def _idle_reaper_loop(self):
-        while not self._shutdown:
-            time.sleep(5)
+        while True:
             with self._cond:
+                if self._shutdown:
+                    return
+                self._cond.wait(timeout=5)
+                if self._shutdown:
+                    return
                 if len(self.instances) <= self.min_instances:
                     continue
                 now = time.time()
@@ -675,6 +693,18 @@ class ElasticOCRPool:
             'format_output': format_output,
             'device_ids': used_device_ids,
         }
+
+    def shutdown(self, wait_timeout: float = 5.0):
+        """优雅停止：通知 reaper 退出 + 等线程清理 + 标记池关闭。"""
+        with self._cond:
+            if self._shutdown:
+                return
+            self._shutdown = True
+            self._cond.notify_all()
+
+        reaper = getattr(self, '_reaper_thread', None)
+        if reaper is not None and reaper.is_alive():
+            reaper.join(timeout=max(0.0, wait_timeout))
 
     def get_pool_stats(self) -> Dict:
         with self._lock:
@@ -811,12 +841,19 @@ async def startup_event():
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    """服务关闭事件"""
+    """服务关闭事件 - 优雅释放 NPU 资源。"""
     global ocr_server
-    
+
     print("正在关闭OCR推理服务...")
-    if ocr_server is not None and hasattr(ocr_server, '_shutdown'):
-        ocr_server._shutdown = True
+    pool = ocr_server
+    ocr_server = None
+    if pool is not None and hasattr(pool, 'shutdown'):
+        try:
+            pool.shutdown()
+        except Exception as exc:
+            print(f"OCR pool shutdown error: {exc}")
+    elif pool is not None and hasattr(pool, '_shutdown'):
+        pool._shutdown = True
     print("OCR推理服务已关闭")
 
 
@@ -832,33 +869,87 @@ async def root():
     }
 
 
+_HEALTH_PROBE_CACHE = {"ts": 0.0, "ok": False, "ttl": 30.0}
+_HEALTH_PROBE_LOCK = threading.Lock()
+
+
+def _run_health_inference_probe() -> bool:
+    """对 OCR pool 跑一次轻量真实推理；30s 缓存避免每次探针都打满 NPU。"""
+    global _HEALTH_PROBE_CACHE
+    now = time.time()
+    cached = _HEALTH_PROBE_CACHE
+    if (now - cached["ts"]) < cached["ttl"]:
+        return cached["ok"]
+
+    with _HEALTH_PROBE_LOCK:
+        # double-check after acquiring lock
+        cached = _HEALTH_PROBE_CACHE
+        if (time.time() - cached["ts"]) < cached["ttl"]:
+            return cached["ok"]
+
+        ok = False
+        try:
+            if ocr_server is not None:
+                tiny = np.full((32, 64, 3), 255, dtype=np.uint8)
+                ok_enc, buf = cv2.imencode(".jpg", tiny)
+                if ok_enc:
+                    image_b64 = base64.b64encode(buf.tobytes()).decode("ascii")
+                    result = ocr_server.process_single_image(
+                        image_b64,
+                        format_output=True,
+                        slice_params=None,
+                    )
+                    ok = bool(result and result.get("success"))
+        except Exception as exc:
+            print(f"health probe failed: {exc}")
+            ok = False
+
+        _HEALTH_PROBE_CACHE = {"ts": time.time(), "ok": ok, "ttl": cached["ttl"]}
+        return ok
+
+
 @app.get("/health", response_model=HealthResponse, summary="健康检查")
-async def health_check():
-    """健康检查接口"""
+async def health_check(probe: int = 0):
+    """
+    健康检查接口。
+
+    - 默认 (`/health`)：仅检查 pool 是否就绪，轻量、可用于高频探针。
+    - `/health?probe=1`：跑一次真实 OCR 推理（带 30s 缓存），用于深度健康检测。
+    """
     global ocr_server
-    
+
     try:
         if ocr_server is None:
-            model_loaded = False
-        elif hasattr(ocr_server, 'ocr_instance'):
-            model_loaded = ocr_server.ocr_instance is not None
-        else:
+            return HealthResponse(
+                status="unhealthy",
+                timestamp=time.time(),
+                device_info="unknown",
+                model_loaded=False,
+            )
+
+        if hasattr(ocr_server, 'get_pool_stats'):
             pool_stats = ocr_server.get_pool_stats()
-            model_loaded = pool_stats.get('ready_instance_count', 0) > 0
-        
+            ready_count = pool_stats.get('ready_instance_count', 0)
+        else:
+            ready_count = 1 if getattr(ocr_server, 'ocr_instance', None) is not None else 0
+
+        if probe and ready_count > 0:
+            ready_count = ready_count if _run_health_inference_probe() else 0
+
         return HealthResponse(
-            status="healthy" if model_loaded else "unhealthy",
+            status="healthy" if ready_count > 0 else "unhealthy",
             timestamp=time.time(),
             device_info=ocr_server.device_info if ocr_server else "unknown",
-            model_loaded=model_loaded
+            model_loaded=ready_count > 0,
         )
-        
-    except Exception as e:
+
+    except Exception as exc:
+        print(f"health_check error: {exc}")
         return HealthResponse(
             status="error",
             timestamp=time.time(),
             device_info="unknown",
-            model_loaded=False
+            model_loaded=False,
         )
 
 
@@ -1122,6 +1213,9 @@ async def get_stats():
 
 
 if __name__ == "__main__":
+    # 抑制 /health /info 探针在 access log 中的噪音
+    logging.getLogger("uvicorn.access").addFilter(_AccessLogProbeFilter())
+
     # 启动服务
     uvicorn.run(
         "ocr_server:app",

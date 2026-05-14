@@ -181,6 +181,11 @@ def main():
 
     # 启动服务
     try:
+        # 抑制 /health /info 探针在 access log 中的噪音
+        import logging
+        from ocr_server import _AccessLogProbeFilter
+        logging.getLogger("uvicorn.access").addFilter(_AccessLogProbeFilter())
+
         uvicorn.run(
             "ocr_server:app",
             host=args.host,
