@@ -901,6 +901,14 @@ class MultiProcessOCRPool:
             self._spawn_worker(device_id)
         self._wait_for_workers_ready(self.workers, self.worker_init_timeout)
 
+        # 启动 monitor 线程（C3）：周期性检查负载，扩/缩容
+        self._monitor_thread = threading.Thread(
+            target=self._monitor_loop,
+            name='ocr-pool-monitor',
+            daemon=True,
+        )
+        self._monitor_thread.start()
+
     # --------- 公共接口（契约保持） ---------
 
     @property
@@ -1128,6 +1136,199 @@ class MultiProcessOCRPool:
             return q.qsize()
         except (NotImplementedError, OSError):
             return -1
+
+    # --------- 扩缩容（C3） ---------
+
+    def _query_npu_hbm_status(self) -> Dict[int, Dict[str, int]]:
+        """读取 npu-smi info，返回每张卡的 HBM 使用情况。结构与 ElasticOCRPool 一致。"""
+        try:
+            completed = subprocess.run(
+                ["npu-smi", "info"],
+                capture_output=True, text=True, timeout=10, check=False,
+            )
+            output = completed.stdout or ""
+            lines = output.splitlines()
+            status: Dict[int, Dict[str, int]] = {}
+            for idx, line in enumerate(lines):
+                stripped = line.strip()
+                if not stripped.startswith("|"):
+                    continue
+                m = re.match(r"^\|\s*(\d+)\s+", stripped)
+                if not m:
+                    continue
+                device_id = int(m.group(1))
+                if device_id not in self.npu_device_ids:
+                    continue
+                if idx + 1 >= len(lines):
+                    continue
+                next_line = lines[idx + 1].strip()
+                hbm_m = re.search(r"(\d+)\s*/\s*(\d+)\s*\|$", next_line)
+                if not hbm_m:
+                    continue
+                used_mb = int(hbm_m.group(1))
+                total_mb = int(hbm_m.group(2))
+                status[device_id] = {
+                    'used_mb': used_mb,
+                    'total_mb': total_mb,
+                    'free_mb': max(0, total_mb - used_mb),
+                }
+            return status
+        except Exception:
+            return {}
+
+    def _assigned_count(self, device_id: int) -> int:
+        with self._workers_lock:
+            return sum(1 for w in self.workers
+                       if w['device_id'] == device_id and not w.get('retiring', False))
+
+    def _pick_device_for_scale_up(self) -> Optional[int]:
+        """填卡优先：从 npu_device_ids 中挑一张能再塞一个实例的卡。
+
+        排序键 (能容纳, -已分配, order, -free_mb)：
+          - 已分配多的优先（填满当前卡，避免分散）
+          - 必须 assigned < per_card_max
+          - 若 npu-smi 取得到 hbm，必须 free_mb >= instance_hbm_mb + safety_margin
+        """
+        hbm_status = self._query_npu_hbm_status()
+        candidates = []
+        for order, device_id in enumerate(self.npu_device_ids):
+            assigned = self._assigned_count(device_id)
+            if assigned >= self.per_card_max:
+                continue
+            if device_id in hbm_status:
+                free_mb = hbm_status[device_id]['free_mb']
+                can_fit = free_mb >= (self.instance_hbm_mb + self.hbm_safety_margin_mb)
+                if not can_fit:
+                    continue
+                score = (-assigned, order, -free_mb)
+            else:
+                # 取不到 HBM 时按优先级兜底
+                score = (-assigned, order, 0)
+            candidates.append((score, device_id))
+        if not candidates:
+            return None
+        candidates.sort()
+        return candidates[0][1]
+
+    def _busy_ready_idle_counts(self):
+        with self._workers_lock:
+            ready = [w for w in self.workers if w['ready'] and not w.get('retiring', False)]
+            busy = sum(1 for w in ready if w['busy_state'].value != 0)
+            idle = len(ready) - busy
+            total_alive = sum(1 for w in self.workers if not w.get('retiring', False))
+            pending = total_alive - len(ready)
+        return len(ready), busy, idle, pending, total_alive
+
+    def _should_scale_up(self) -> bool:
+        if self._shutdown:
+            return False
+        ready, busy, idle, pending, total = self._busy_ready_idle_counts()
+        if total + pending >= self.max_instances:
+            return False
+        if pending > 0:
+            return False  # 已经在扩容中
+        if (time.time() - self._last_scale_up) < self.scale_cooldown:
+            return False
+        # 触发条件：有积压 或 所有就绪 worker 都在忙
+        qsize = self._safe_qsize(self.task_q)
+        has_pressure = (qsize and qsize > 0) or (ready > 0 and busy == ready)
+        if not has_pressure:
+            return False
+        return self._pick_device_for_scale_up() is not None
+
+    def _scale_up_one(self):
+        device_id = self._pick_device_for_scale_up()
+        if device_id is None:
+            return
+        print(f"[pool] scale up: spawning new worker on npu:{device_id}", flush=True)
+        worker = self._spawn_worker(device_id)
+        self._last_scale_up = time.time()
+        # 异步等 ready，不阻塞 monitor loop
+        threading.Thread(
+            target=self._wait_for_workers_ready,
+            args=([worker], self.worker_init_timeout),
+            name=f"ocr-scaleup-wait-{worker['worker_id']}",
+            daemon=True,
+        ).start()
+
+    def _pick_worker_to_retire(self) -> Optional[Dict]:
+        """缩容选 worker：必须 idle、ready、未 retiring；优先选同卡上有兄弟的（即 device_id assigned > 1），
+        且 last_used 最早的。保证每张卡至少留 1 个实例（直到 total <= min_instances）。"""
+        now = time.time()
+        with self._workers_lock:
+            candidates = []
+            for w in self.workers:
+                if not w['ready'] or w.get('retiring', False):
+                    continue
+                if w['busy_state'].value != 0:
+                    continue
+                if (now - w['last_used_state'].value) < self.idle_timeout:
+                    continue
+                same_card = sum(1 for x in self.workers
+                                if x['device_id'] == w['device_id']
+                                and not x.get('retiring', False))
+                # 优先缩同卡多实例
+                priority = 0 if same_card > 1 else 1
+                candidates.append((priority, w['last_used_state'].value, w))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda x: (x[0], x[1]))
+        return candidates[0][2]
+
+    def _maybe_scale_down(self):
+        if self._shutdown:
+            return
+        ready, busy, idle, pending, total = self._busy_ready_idle_counts()
+        if total <= self.min_instances:
+            return
+        target = self._pick_worker_to_retire()
+        if target is None:
+            return
+        print(f"[pool] scale down: retiring worker {target['worker_id']} (npu:{target['device_id']})", flush=True)
+        with self._workers_lock:
+            target['retiring'] = True
+        # 投一个 None sentinel，target worker 会接住它退出
+        try:
+            self.task_q.put(None, timeout=1.0)
+        except Exception:
+            pass
+        # 异步等它真的死掉再从 workers 列表里清除
+        threading.Thread(
+            target=self._reap_retired_worker,
+            args=(target,),
+            name=f"ocr-reap-{target['worker_id']}",
+            daemon=True,
+        ).start()
+
+    def _reap_retired_worker(self, worker: Dict, kill_after: float = 30.0):
+        worker['process'].join(timeout=kill_after)
+        if worker['process'].is_alive():
+            print(f"[pool] worker {worker['worker_id']} did not exit in {kill_after}s, killing", flush=True)
+            try:
+                worker['process'].kill()
+            except Exception:
+                pass
+        with self._workers_lock:
+            try:
+                self.workers.remove(worker)
+            except ValueError:
+                pass
+
+    def _monitor_loop(self):
+        """每 monitor_interval 秒检查一次负载，触发扩/缩容。"""
+        while not self._shutdown:
+            try:
+                if self._should_scale_up():
+                    self._scale_up_one()
+                else:
+                    self._maybe_scale_down()
+            except Exception as exc:
+                print(f"[pool] monitor loop error: {exc!r}", flush=True)
+            # 短睡一段，再检查 shutdown
+            for _ in range(int(self.monitor_interval * 10)):
+                if self._shutdown:
+                    return
+                time.sleep(0.1)
 
 
 ocr_server = None
