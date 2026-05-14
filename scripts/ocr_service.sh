@@ -151,9 +151,19 @@ stop_port_processes() {
     fi
   fi
 
-  echo "Could not resolve listener PID from ss/lsof/fuser, fallback to pkill"
-  pkill -f "python start_server.py.*--port $PORT" 2>/dev/null || true
-  pkill -f "uvicorn.*$PORT" 2>/dev/null || true
+  echo "Could not resolve listener PID from ss/lsof/fuser, falling back to pkill on cmdline"
+  # 注意：setsid + disown 之后，pkill 仍能匹配 /proc/PID/cmdline。
+  # 不再带 --port 过滤，避免端口环境变量与实际进程不一致时漏杀。
+  # SIGTERM 优先，等几秒后用 SIGKILL 兜底。
+  pkill -f "python.*start_server\.py" 2>/dev/null || true
+  pkill -f "uvicorn.*ocr_server" 2>/dev/null || true
+  sleep 2
+  if wait_for_port_release 6 0.5; then
+    return 0
+  fi
+
+  pkill -9 -f "python.*start_server\.py" 2>/dev/null || true
+  pkill -9 -f "uvicorn.*ocr_server" 2>/dev/null || true
   sleep 1
 
   if wait_for_port_release 10 0.5; then
@@ -255,22 +265,39 @@ stop_service() {
   local pid
   pid="$(read_pid)"
 
-  if [ -n "$pid" ]; then
+  if [ -n "$pid" ] && is_pid_running "$pid"; then
+    echo "Sending SIGTERM to PID=$pid"
+    kill "$pid" 2>/dev/null || true
+    # 等到 PID 退出或最多 10 秒
+    local i
+    for ((i=0; i<20; i++)); do
+      if ! is_pid_running "$pid"; then break; fi
+      sleep 0.5
+    done
     if is_pid_running "$pid"; then
-      kill "$pid"
-      echo "Stopped OCR service PID=$pid"
-    else
-      echo "Process PID=$pid is not running"
+      echo "PID=$pid still alive after 10s, sending SIGKILL"
+      kill -9 "$pid" 2>/dev/null || true
     fi
   else
-    echo "OCR service is not running"
+    echo "No tracked OCR service PID; will rely on cmdline scan"
   fi
 
-  if port_in_use; then
-    echo "Port $PORT is still occupied, stopping listener(s) by port"
+  # 端口残留 / 孤儿进程清理：不论 PID file 是否对得上，强制按 cmdline 扫一次
+  if port_in_use || pgrep -f "python.*start_server\.py" >/dev/null 2>&1; then
     stop_port_processes || true
   fi
+
   rm -f "$PID_FILE"
+  echo "Stop complete."
+}
+
+purge_service() {
+  echo "Force purge: killing all start_server.py / ocr_server uvicorn processes"
+  pkill -9 -f "python.*start_server\.py" 2>/dev/null || true
+  pkill -9 -f "uvicorn.*ocr_server" 2>/dev/null || true
+  sleep 1
+  rm -f "$PID_FILE"
+  echo "Purge complete."
 }
 
 status_service() {
@@ -302,6 +329,9 @@ case "$CMD" in
   restart)
     restart_service
     ;;
+  purge)
+    purge_service
+    ;;
   status)
     status_service
     ;;
@@ -309,7 +339,7 @@ case "$CMD" in
     show_logs
     ;;
   *)
-    echo "Usage: bash scripts/ocr_service.sh {start|stop|restart|status|logs}"
+    echo "Usage: bash scripts/ocr_service.sh {start|stop|restart|purge|status|logs}"
     exit 1
     ;;
 esac
