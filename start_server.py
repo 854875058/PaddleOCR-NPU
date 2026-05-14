@@ -33,6 +33,7 @@ def parse_args():
     parser.add_argument("--hbm_safety_margin_mb", type=int, default=4096, help="每张卡保留的HBM安全余量，单位MB")
     parser.add_argument("--monitor_interval", type=float, default=3.0, help="弹性伸缩监控间隔（秒）")
     parser.add_argument("--worker_init_timeout", type=float, default=300.0, help="单个 worker 初始化超时（秒）")
+    parser.add_argument("--skip_warmup", action="store_true", help="跳过 worker init 阶段的 dummy 推理预热（调试用）")
     
     # 模型路径配置
     parser.add_argument("--det_model_path", type=str, default="./models/ptocr_v5_server_det.pth", help="检测模型路径")
@@ -148,6 +149,7 @@ def main():
     os.environ['OCR_HBM_SAFETY_MARGIN_MB'] = str(args.hbm_safety_margin_mb)
     os.environ['OCR_MONITOR_INTERVAL'] = str(args.monitor_interval)
     os.environ['OCR_WORKER_INIT_TIMEOUT'] = str(args.worker_init_timeout)
+    os.environ['OCR_SKIP_WARMUP'] = 'true' if args.skip_warmup else 'false'
     
     # 模型路径配置
     os.environ['OCR_DET_MODEL_PATH'] = args.det_model_path

@@ -765,19 +765,21 @@ def ocr_worker_main(
         # 关键：OCRServer 实例化挪到子进程，父进程不再创建
         server = OCRServer(use_npu=True, **kwargs)
 
-        # 自动预热：跑一次 dummy 推理，把首帧 warmup 的延迟（~25s）藏进 init 阶段。
-        # 没这一步的话，第一个真用户请求会被这 25s 拖累。
-        try:
-            import base64 as _b64
-            import cv2 as _cv2
-            import numpy as _np
-            _dummy = _np.full((512, 512, 3), 255, dtype=_np.uint8)
-            _ok, _buf = _cv2.imencode('.jpg', _dummy)
-            if _ok:
-                _b = _b64.b64encode(_buf.tobytes()).decode('ascii')
-                server.process_single_image(_b, format_output=False, slice_params=None)
-        except Exception as _exc:
-            print(f"[worker {worker_id}] warmup failed (non-fatal): {_exc!r}", flush=True)
+        # 自动预热（可通过 ocr_kwargs['skip_warmup']=True 关掉）：
+        # 跑一次 dummy 推理，把首帧 warmup 的延迟（~25s）藏进 init 阶段。
+        # 注意：必须在 ready_event.set() 之前完成，否则 dispatcher 会派任务过来。
+        if not ocr_kwargs.get('skip_warmup', False):
+            try:
+                import base64 as _b64
+                import cv2 as _cv2
+                import numpy as _np
+                _dummy = _np.full((512, 512, 3), 255, dtype=_np.uint8)
+                _ok, _buf = _cv2.imencode('.jpg', _dummy)
+                if _ok:
+                    _b = _b64.b64encode(_buf.tobytes()).decode('ascii')
+                    server.process_single_image(_b, format_output=False, slice_params=None)
+            except Exception as _exc:
+                print(f"[worker {worker_id}] warmup failed (non-fatal): {_exc!r}", flush=True)
 
         ready_event.set()
     except Exception as exc:
@@ -1623,6 +1625,8 @@ async def startup_event():
         }
 
         # 使用多进程池：每实例一个独立 OS 进程，支持同卡多实例 + 动态扩缩容
+        if os.getenv('OCR_SKIP_WARMUP', 'false').lower() == 'true':
+            ocr_config['skip_warmup'] = True
         ocr_server = MultiProcessOCRPool(**elastic_config, **ocr_config)
 
         cls_status = "启用" if use_angle_cls else "禁用"
