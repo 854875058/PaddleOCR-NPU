@@ -180,7 +180,7 @@ start_service() {
   if [ -n "$old_pid" ] && is_pid_running "$old_pid"; then
     echo "OCR service is already running with PID=$old_pid"
     echo "Log file: $LOG_FILE"
-    show_logs
+    return 0
   fi
 
   if port_in_use; then
@@ -225,7 +225,8 @@ start_service() {
   echo "  log_file=$LOG_FILE"
   echo "  pid_file=$PID_FILE"
 
-  nohup python start_server.py \
+  # setsid 让子进程脱离当前 session，避免 SSH 关闭/Ctrl+C 杀掉服务
+  setsid nohup python start_server.py \
     --host "$HOST" \
     --port "$PORT" \
     --npu_device_ids "$SERVICE_LOCAL_NPU_DEVICE_IDS" \
@@ -238,13 +239,15 @@ start_service() {
     --batch_acquire_wait "$BATCH_ACQUIRE_WAIT" \
     --instance_hbm_mb "$INSTANCE_HBM_MB" \
     --hbm_safety_margin_mb "$HBM_SAFETY_MARGIN_MB" \
-    > "$LOG_FILE" 2>&1 &
+    > "$LOG_FILE" 2>&1 < /dev/null &
 
   local new_pid=$!
+  disown $new_pid 2>/dev/null || true
   echo "$new_pid" > "$PID_FILE"
   echo "OCR service started in background with PID=$new_pid"
-  sleep 2
-  show_logs
+  echo "Log file: $LOG_FILE"
+  echo "Tail logs:  bash scripts/ocr_service.sh logs"
+  echo "Status:     bash scripts/ocr_service.sh status"
 }
 
 stop_service() {
