@@ -52,7 +52,7 @@ def parse_args():
     # 检测模型参数
     parser.add_argument("--det_db_thresh", type=float, default=0.12, help="检测阈值，越小检测越敏感")
     parser.add_argument("--det_db_box_thresh", type=float, default=0.15, help="边界框阈值")
-    parser.add_argument("--det_limit_side_len", type=int, default=960, help="检测图像边长限制")
+    parser.add_argument("--det_limit_side_len", type=int, default=1920, help="检测图像边长限制（默认1920，覆盖大部分1080p视频帧）")
     parser.add_argument("--det_db_unclip_ratio", type=float, default=1.8, help="文本框扩展比例")
     parser.add_argument("--drop_score", type=float, default=0.5, help="置信度过滤阈值")
     
