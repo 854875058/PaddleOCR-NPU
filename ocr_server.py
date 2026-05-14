@@ -503,8 +503,8 @@ class ElasticOCRPool:
         now = time.time()
         if self._total_instance_count() >= self.max_instances:
             return
-        if self.pending_instances > 0:
-            return
+        # 注意：不再因 pending>0 一票否决——同卡多实例可以并行加载，应该允许在
+        # 冷却间隔内连续触发，否则单 worker init 慢时其它请求被卡住。
         if (now - self.last_scale_up_time) < self.scale_cooldown:
             return
         device_id = self._pick_scale_device()
