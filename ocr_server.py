@@ -764,6 +764,21 @@ def ocr_worker_main(
         kwargs['npu_device_id'] = device_id
         # 关键：OCRServer 实例化挪到子进程，父进程不再创建
         server = OCRServer(use_npu=True, **kwargs)
+
+        # 自动预热：跑一次 dummy 推理，把首帧 warmup 的延迟（~25s）藏进 init 阶段。
+        # 没这一步的话，第一个真用户请求会被这 25s 拖累。
+        try:
+            import base64 as _b64
+            import cv2 as _cv2
+            import numpy as _np
+            _dummy = _np.full((512, 512, 3), 255, dtype=_np.uint8)
+            _ok, _buf = _cv2.imencode('.jpg', _dummy)
+            if _ok:
+                _b = _b64.b64encode(_buf.tobytes()).decode('ascii')
+                server.process_single_image(_b, format_output=False, slice_params=None)
+        except Exception as _exc:
+            print(f"[worker {worker_id}] warmup failed (non-fatal): {_exc!r}", flush=True)
+
         ready_event.set()
     except Exception as exc:
         # init 失败时通过 result_q 报一次，父进程能感知到 worker 死掉
@@ -941,11 +956,78 @@ class MultiProcessOCRPool:
                 'format_output': format_output,
                 'device_ids': [],
             }
-        return self._dispatch('batch', dict(
-            images=images,
-            format_output=format_output,
-            use_optimized=use_optimized,
-        ))
+        # 单张直接走 single（避免拆桶 overhead）
+        if len(images) == 1:
+            return self._dispatch('batch', dict(
+                images=images, format_output=format_output, use_optimized=use_optimized,
+            ))
+
+        # 多张图：按当前 ready 实例数 round-robin 拆桶并行派发
+        start = time.time()
+        with self._workers_lock:
+            n_ready = sum(1 for w in self.workers
+                          if w['ready'] and not w.get('retiring', False))
+        n_buckets = max(1, min(n_ready, len(images)))
+        if n_buckets == 1:
+            return self._dispatch('batch', dict(
+                images=images, format_output=format_output, use_optimized=use_optimized,
+            ))
+
+        # 拆桶：images[i] 进 buckets[i % n_buckets]
+        buckets: List[List[int]] = [[] for _ in range(n_buckets)]
+        for i in range(len(images)):
+            buckets[i % n_buckets].append(i)
+
+        merged: List = [None] * len(images)
+        total_text = 0
+        used_devs: List[int] = []
+        sub_method = 'optimized' if use_optimized else 'traditional'
+
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        with ThreadPoolExecutor(max_workers=n_buckets,
+                                thread_name_prefix='ocr-batch-fanout') as ex:
+            future_to_indices = {}
+            for indices in buckets:
+                if not indices:
+                    continue
+                sub_images = [images[i] for i in indices]
+                fut = ex.submit(self._dispatch, 'batch', dict(
+                    images=sub_images, format_output=format_output,
+                    use_optimized=use_optimized,
+                ))
+                future_to_indices[fut] = indices
+
+            for fut in as_completed(future_to_indices):
+                indices = future_to_indices[fut]
+                sub_result = fut.result()
+                if not sub_result.get('success'):
+                    return {
+                        'success': False,
+                        'error': sub_result.get('error', 'sub-batch failed'),
+                        'processing_time': time.time() - start,
+                        'image_count': len(images),
+                        'total_text_count': 0,
+                        'method_used': sub_method,
+                        'format_output': format_output,
+                    }
+                sub_results = sub_result.get('results', [])
+                for slot_idx, original_idx in enumerate(indices):
+                    if slot_idx < len(sub_results):
+                        merged[original_idx] = sub_results[slot_idx]
+                total_text += sub_result.get('total_text_count', 0)
+                if sub_result.get('device_ids'):
+                    used_devs.extend(sub_result['device_ids'])
+
+        return {
+            'success': True,
+            'results': merged,
+            'processing_time': time.time() - start,
+            'image_count': len(images),
+            'total_text_count': total_text,
+            'method_used': f"{sub_method}_fanout",
+            'format_output': format_output,
+            'device_ids': sorted(set(used_devs)) if used_devs else [],
+        }
 
     def get_pool_stats(self) -> Dict:
         with self._workers_lock:
