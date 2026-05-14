@@ -1628,6 +1628,13 @@ async def startup_event():
         if os.getenv('OCR_SKIP_WARMUP', 'false').lower() == 'true':
             ocr_config['skip_warmup'] = True
 
+        # 调试用：OCR_DEBUG_NO_POOL=true 跳过整个池创建，只起 uvicorn
+        # 用来验证"是不是 pool 创建/启动让 event loop 死掉"
+        if os.getenv('OCR_DEBUG_NO_POOL', 'false').lower() == 'true':
+            print("⚠️  OCR_DEBUG_NO_POOL=true: skipping pool creation, server has no OCR backend")
+            ocr_server = None
+            return
+
         # 关键：MultiProcessOCRPool.__init__ 同步等 worker init 50s+，
         # 不能阻塞 asyncio event loop（uvicorn handler 全卡死）。
         # 用 run_in_executor 把它丢到线程池里。
