@@ -463,6 +463,21 @@ class ElasticOCRPool:
         server_kwargs = dict(self.ocr_kwargs)
         server_kwargs['npu_device_id'] = device_id
         server = OCRServer(**server_kwargs)
+
+        # 自动预热：跑一次 dummy 推理，把首帧 warmup（~20s）藏在 init 阶段，
+        # 否则新 ready 的实例处理第一个真请求会被那 20s 拖累。
+        try:
+            import base64 as _b64
+            import cv2 as _cv2
+            import numpy as _np
+            _dummy = _np.full((512, 512, 3), 255, dtype=_np.uint8)
+            _ok, _buf = _cv2.imencode('.jpg', _dummy)
+            if _ok:
+                _b = _b64.b64encode(_buf.tobytes()).decode('ascii')
+                server.process_single_image(_b, format_output=False, slice_params=None)
+        except Exception as _exc:
+            print(f"[ElasticOCRPool] warmup failed (non-fatal): {_exc!r}", flush=True)
+
         now = time.time()
         with self._lock:
             instance = {
