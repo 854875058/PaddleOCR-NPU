@@ -35,16 +35,21 @@ from pytorch_paddle import PytorchPaddleOCR, create_ocr
 
 
 class _AccessLogProbeFilter(logging.Filter):
-    """过滤 uvicorn access 日志中的 /health 和 /info 探针请求，避免淹没真错误。"""
+    """过滤高频成功请求的 uvicorn access 日志，避免淹没池子状态和错误。"""
 
-    _PATHS = ('/health', '/info')
+    _ALWAYS_HIDE_PATHS = ('/health', '/info')
+    _HIDE_ON_200_PATHS = ('/ocr/single', '/ocr/batch')
 
     def filter(self, record: logging.LogRecord) -> bool:
         try:
             msg = record.getMessage()
         except Exception:
             return True
-        return not any(f' {p}' in msg or f' {p}?' in msg for p in self._PATHS)
+        if any(f' {p}' in msg or f' {p}?' in msg for p in self._ALWAYS_HIDE_PATHS):
+            return False
+        if ' 200 OK' in msg and any(f' {p}' in msg or f' {p}?' in msg for p in self._HIDE_ON_200_PATHS):
+            return False
+        return True
 
 
 class OCRRequest(BaseModel):
@@ -73,6 +78,12 @@ class InfoResponse(BaseModel):
     device_info: str = Field(..., description="设备信息")
     supported_formats: List[str] = Field(..., description="支持的图像格式")
     max_image_size: str = Field(..., description="最大图像尺寸")
+    task_queue_size: int = Field(0, description="当前待处理任务排队数")
+    waiting_request_count: int = Field(0, description="当前等待分配worker的请求数")
+    ready_instance_count: int = Field(0, description="当前ready实例数")
+    assignable_instance_count: int = Field(0, description="当前可接单实例数")
+    busy_instance_count: int = Field(0, description="当前忙碌实例数")
+    idle_instance_count: int = Field(0, description="当前空闲实例数")
 
 
 class OCRServer:
@@ -345,7 +356,7 @@ class ElasticOCRPool:
         npu_device_ids: List[int],
         min_instances: int = 1,
         max_instances: int = 3,
-        idle_timeout: int = 120,
+        idle_timeout: int = 600,
         scale_cooldown: int = 15,
         batch_acquire_wait: float = 8.0,
         instance_hbm_mb: int = 20000,
@@ -880,7 +891,7 @@ class MultiProcessOCRPool:
         min_instances: int = 1,
         max_instances: int = 32,
         per_card_max: int = 0,
-        idle_timeout: int = 120,
+        idle_timeout: int = 600,
         scale_cooldown: int = 15,
         batch_acquire_wait: float = 8.0,
         instance_hbm_mb: int = 8000,
@@ -888,6 +899,8 @@ class MultiProcessOCRPool:
         result_timeout: float = 300.0,
         monitor_interval: float = 3.0,
         worker_init_timeout: float = 240.0,
+        worker_assign_delay_sec: float = 5.0,
+        stats_log_interval: float = 5.0,
         **ocr_kwargs,
     ):
         self.npu_device_ids = list(dict.fromkeys(npu_device_ids or [ocr_kwargs.get('npu_device_id', 0)]))
@@ -903,6 +916,8 @@ class MultiProcessOCRPool:
         self.result_timeout = max(10.0, result_timeout)
         self.monitor_interval = max(1.0, monitor_interval)
         self.worker_init_timeout = max(30.0, worker_init_timeout)
+        self.worker_assign_delay_sec = max(0.0, worker_assign_delay_sec)
+        self.stats_log_interval = max(1.0, stats_log_interval)
         self.ocr_kwargs = dict(ocr_kwargs)
         # 父进程不能持有 npu_device_id，避免误用
         self.ocr_kwargs.pop('npu_device_id', None)
@@ -922,9 +937,11 @@ class MultiProcessOCRPool:
         self.pending: Dict[str, Dict] = {}
         self._workers_lock = threading.Lock()
         self._pending_lock = threading.Lock()
+        self._dispatch_waiters = 0
         self._shutdown = False
         self._worker_seq = 0
         self._last_scale_up = 0.0
+        self._last_scale_up_decline_reason = None
 
         # 启动 demux 线程（必须在 spawn worker 之前，避免 worker init 失败信号丢失）
         # 调试用：OCR_DEBUG_NO_THREADS=true 不启动 demux + monitor，验证是否是它们破坏 event loop
@@ -940,17 +957,32 @@ class MultiProcessOCRPool:
         # 同步起 min_instances 个 worker
         primary_devices = self._initial_device_round_robin(self.min_instances)
         for device_id in primary_devices:
-            self._spawn_worker(device_id)
+            self._spawn_worker(device_id, apply_assign_delay=False)
         self._wait_for_workers_ready(self.workers, self.worker_init_timeout)
 
         # 启动 monitor 线程（C3）：周期性检查负载，扩/缩容
+        self._monitor_thread = None
+        self._stats_thread = None
         if not _no_threads:
             self._monitor_thread = threading.Thread(
                 target=self._monitor_loop,
                 name='ocr-pool-monitor',
                 daemon=True,
             )
-            self._monitor_thread.start()
+            self._stats_thread = threading.Thread(
+                target=self._stats_loop,
+                name='ocr-pool-stats',
+                daemon=True,
+            )
+
+    def start_background_threads(self):
+        """延后启动后台线程，避免在 FastAPI startup 阶段抢锁卡住主线程。"""
+        if self._shutdown:
+            return
+        for attr in ('_monitor_thread', '_stats_thread'):
+            thread = getattr(self, attr, None)
+            if thread is not None and not thread.is_alive():
+                thread.start()
 
     # --------- 公共接口（契约保持） ---------
 
@@ -1062,13 +1094,25 @@ class MultiProcessOCRPool:
 
     def get_pool_stats(self) -> Dict:
         with self._workers_lock:
+            now = time.time()
             ready_workers = [w for w in self.workers if w['ready']]
-            busy_workers = [w for w in ready_workers if w['busy_state'].value != 0]
-            idle_workers = [w for w in ready_workers if w['busy_state'].value == 0]
+            assignable_workers = [
+                w for w in ready_workers
+                if now >= (w.get('eligible_at') or 0.0) and not w.get('retiring', False)
+            ]
+            idle_workers = [w for w in assignable_workers if w['busy_state'].value == 0]
             per_device: Dict[str, int] = {}
-            for w in ready_workers:
+            worker_task_queue_size = 0
+            for w in assignable_workers:
                 key = str(w['device_id'])
                 per_device[key] = per_device.get(key, 0) + 1
+            for w in self.workers:
+                if w.get('retiring', False):
+                    continue
+                busy_flag = 1 if w['busy_state'].value != 0 else 0
+                worker_task_queue_size += max(0, int(w.get('inflight', 0)) - busy_flag)
+            waiting_request_count = int(self._dispatch_waiters)
+            task_queue_size = worker_task_queue_size + waiting_request_count
             return {
                 'min_instances': self.min_instances,
                 'max_instances': self.max_instances,
@@ -1076,12 +1120,16 @@ class MultiProcessOCRPool:
                 'configured_device_ids': self.npu_device_ids,
                 'instance_hbm_mb': self.instance_hbm_mb,
                 'hbm_safety_margin_mb': self.hbm_safety_margin_mb,
+                'worker_assign_delay_sec': self.worker_assign_delay_sec,
                 'ready_instance_count': len(ready_workers),
-                'busy_instance_count': len(busy_workers),
+                'assignable_instance_count': len(assignable_workers),
+                'busy_instance_count': len([w for w in assignable_workers if w['busy_state'].value != 0]),
                 'idle_instance_count': len(idle_workers),
                 'pending_instance_count': sum(1 for w in self.workers if not w['ready']),
                 'instances_per_device': per_device,
-                'task_queue_size': self._total_queued_tasks(),
+                'waiting_request_count': waiting_request_count,
+                'worker_task_queue_size': worker_task_queue_size,
+                'task_queue_size': task_queue_size,
             }
 
     def shutdown(self, wait_timeout: float = 5.0):
@@ -1125,7 +1173,13 @@ class MultiProcessOCRPool:
             return {'success': False, 'error': 'pool is shutting down'}
 
         # 选 ready worker（如果都 busy，选 inflight 最小的；至多等 batch_acquire_wait）
-        worker = self._pick_target_worker(wait_seconds=self.batch_acquire_wait)
+        with self._workers_lock:
+            self._dispatch_waiters += 1
+        try:
+            worker = self._pick_target_worker(wait_seconds=self.batch_acquire_wait)
+        finally:
+            with self._workers_lock:
+                self._dispatch_waiters = max(0, self._dispatch_waiters - 1)
         if worker is None:
             self.error_count += 1
             return {'success': False, 'error': 'no ready OCR worker available'}
@@ -1168,8 +1222,13 @@ class MultiProcessOCRPool:
         deadline = time.time() + wait_seconds
         while True:
             with self._workers_lock:
-                ready = [w for w in self.workers
-                         if w['ready'] and not w.get('retiring', False)]
+                now = time.time()
+                ready = [
+                    w for w in self.workers
+                    if w['ready']
+                    and not w.get('retiring', False)
+                    and now >= (w.get('eligible_at') or 0.0)
+                ]
                 if ready:
                     # 优先 busy_state==0 且 inflight==0 的
                     idle = [w for w in ready
@@ -1219,7 +1278,7 @@ class MultiProcessOCRPool:
                                 w['inflight'] = max(0, w.get('inflight', 0) - 1)
                                 break
 
-    def _spawn_worker(self, device_id: int) -> Dict:
+    def _spawn_worker(self, device_id: int, apply_assign_delay: bool = True) -> Dict:
         """spawn 一个新 worker 进程。返回 worker dict（未必 ready）。
 
         每个 worker 拥有自己的 task_q（私有），父进程仅向当前 idle worker 派单。
@@ -1252,6 +1311,9 @@ class MultiProcessOCRPool:
             'ready': False,
             'retiring': False,
             'spawned_at': time.time(),
+            'apply_assign_delay': bool(apply_assign_delay),
+            'ready_at': None,
+            'eligible_at': None,
             'inflight': 0,  # dispatcher 派出但 worker 尚未回报的任务计数
         }
         with self._workers_lock:
@@ -1265,19 +1327,44 @@ class MultiProcessOCRPool:
             remaining = max(0.0, deadline - time.time())
             if w['ready_event'].wait(timeout=remaining):
                 w['ready'] = True
+                now = time.time()
+                w['ready_at'] = now
+                delay_sec = self.worker_assign_delay_sec if w.get('apply_assign_delay', True) else 0.0
+                w['eligible_at'] = now + delay_sec
                 ready.append(w)
                 # ready 状态变化打印一行，便于观察扩容是否生效
                 ready_count = sum(1 for x in self.workers if x['ready'])
-                print(f"[pool] worker {w['worker_id']} ready (now ready_count={ready_count})", flush=True)
+                print(
+                    f"[pool] worker {w['worker_id']} ready "
+                    f"(now ready_count={ready_count}, assign_delay={delay_sec:.1f}s, "
+                    f"eligible_at={w['eligible_at']:.3f})",
+                    flush=True,
+                )
             else:
                 print(f"[pool] worker {w['worker_id']} init timeout after {timeout}s", flush=True)
+                try:
+                    if w['process'].is_alive():
+                        w['process'].kill()
+                except Exception:
+                    pass
+                with self._workers_lock:
+                    try:
+                        self.workers.remove(w)
+                    except ValueError:
+                        pass
         return ready
 
     def _has_ready_worker(self, wait_seconds: float = 0.0) -> bool:
         deadline = time.time() + wait_seconds
         while True:
             with self._workers_lock:
-                if any(w['ready'] and not w.get('retiring', False) for w in self.workers):
+                now = time.time()
+                if any(
+                    w['ready']
+                    and not w.get('retiring', False)
+                    and now >= (w.get('eligible_at') or 0.0)
+                    for w in self.workers
+                ):
                     return True
             if time.time() >= deadline:
                 return False
@@ -1292,23 +1379,26 @@ class MultiProcessOCRPool:
             result.append(self.npu_device_ids[i % len(self.npu_device_ids)])
         return result
 
-    @staticmethod
-    def _safe_qsize(q) -> int:
-        try:
-            return q.qsize()
-        except (NotImplementedError, OSError):
-            return -1
-
     def _total_queued_tasks(self) -> int:
-        """跨所有 worker 的真实排队任务总数（仅 mp.Queue 中尚未被取走的）。"""
+        """跨所有 worker 的排队任务估算值。
+
+        不直接调用 multiprocessing.Queue.qsize()，因为它在部分环境下会卡住，
+        进而把 /info 和 monitor stats 日志一起拖死。
+
+        这里用每个 worker 的 inflight 和 busy_state 估算：
+        - inflight 表示已派给该 worker、但尚未回报结果的任务总数
+        - busy_state ∈ {0,1}，表示当前是否正在执行 1 个任务
+        因此：
+          queued ~= max(0, inflight - busy_flag)
+        """
         total = 0
         with self._workers_lock:
             for w in self.workers:
                 if w.get('retiring', False):
                     continue
-                qs = self._safe_qsize(w['task_q'])
-                if qs > 0:
-                    total += qs
+                busy_flag = 1 if w['busy_state'].value != 0 else 0
+                queued = max(0, int(w.get('inflight', 0)) - busy_flag)
+                total += queued
         return total
 
     # --------- 扩缩容（C3） ---------
@@ -1361,53 +1451,94 @@ class MultiProcessOCRPool:
         排序键 (能容纳, -已分配, order, -free_mb)：
           - 已分配多的优先（填满当前卡，避免分散）
           - per_card_max > 0 时必须 assigned < per_card_max；per_card_max <= 0 表示不限制
-          - 必须 npu-smi 取得到 hbm 且 free_mb >= instance_hbm_mb + safety_margin
-            （取不到 hbm 视为"不确定是否被外部占用"，保守拒绝扩容，避免 OOM）
+          - 优先选择 npu-smi 能读取到 HBM，且 free_mb >= instance_hbm_mb + safety_margin 的卡
+          - 对于个别取不到 HBM 的卡，不再一票否决；如果该卡还没达到 per_card_max，
+            则作为低优先级兜底候选，避免因为单卡观测缺失把全局上限锁死
         """
         hbm_status = self._query_npu_hbm_status()
-        if not hbm_status:
-            print(f"[pool] scale-up declined: npu-smi gave no HBM info; refusing to risk OOM",
-                  flush=True)
-            return None
 
         candidates = []
+        fallback_candidates = []
         rejected_reasons = []
+        need_mb = self.instance_hbm_mb + self.hbm_safety_margin_mb
         for order, device_id in enumerate(self.npu_device_ids):
             assigned = self._assigned_count(device_id)
             if self.per_card_max > 0 and assigned >= self.per_card_max:
                 rejected_reasons.append(f"npu:{device_id}(per_card_max={self.per_card_max} reached)")
                 continue
             if device_id not in hbm_status:
-                rejected_reasons.append(f"npu:{device_id}(no hbm info)")
+                fallback_score = (1, -assigned, order, 0)
+                fallback_candidates.append((fallback_score, device_id))
+                rejected_reasons.append(f"npu:{device_id}(no hbm info, fallback only)")
                 continue
             free_mb = hbm_status[device_id]['free_mb']
-            need_mb = self.instance_hbm_mb + self.hbm_safety_margin_mb
             if free_mb < need_mb:
                 rejected_reasons.append(f"npu:{device_id}(free={free_mb}MB < need={need_mb}MB)")
                 continue
-            score = (-assigned, order, -free_mb)
+            score = (0, -assigned, order, -free_mb)
             candidates.append((score, device_id))
+        if candidates:
+            candidates.sort()
+            self._last_scale_up_decline_reason = None
+            return candidates[0][1]
+        if fallback_candidates:
+            fallback_candidates.sort()
+            chosen = fallback_candidates[0][1]
+            reason = f"using fallback scale-up target npu:{chosen} without HBM info"
+            if self._last_scale_up_decline_reason != reason:
+                print(f"[pool] scale-up fallback: {reason}", flush=True)
+                self._last_scale_up_decline_reason = reason
+            return chosen
+        if not hbm_status:
+            reason = "npu-smi gave no HBM info; refusing to risk OOM"
+            if self._last_scale_up_decline_reason != reason:
+                print(f"[pool] scale-up declined: {reason}", flush=True)
+                self._last_scale_up_decline_reason = reason
+            return None
         if not candidates:
             if rejected_reasons:
-                print(f"[pool] scale-up declined: {'; '.join(rejected_reasons)}", flush=True)
+                reason = '; '.join(rejected_reasons)
+                if self._last_scale_up_decline_reason != reason:
+                    print(f"[pool] scale-up declined: {reason}", flush=True)
+                    self._last_scale_up_decline_reason = reason
             return None
-        candidates.sort()
-        return candidates[0][1]
+        return None
 
     def _busy_ready_idle_counts(self):
         with self._workers_lock:
+            now = time.time()
             ready = [w for w in self.workers if w['ready'] and not w.get('retiring', False)]
-            busy = sum(1 for w in ready if w['busy_state'].value != 0)
-            idle = len(ready) - busy
+            assignable = [w for w in ready if now >= (w.get('eligible_at') or 0.0)]
+            busy = sum(1 for w in assignable if w['busy_state'].value != 0)
+            idle = len(assignable) - busy
             total_alive = sum(1 for w in self.workers if not w.get('retiring', False))
             pending = total_alive - len(ready)
-        return len(ready), busy, idle, pending, total_alive
+        return len(assignable), busy, idle, pending, total_alive
+
+    def _log_pool_stats(self):
+        try:
+            stats = self.get_pool_stats()
+            print(
+                "[pool] stats "
+                f"queue={stats.get('task_queue_size', 0)} "
+                f"waiting={stats.get('waiting_request_count', 0)} "
+                f"worker_q={stats.get('worker_task_queue_size', 0)} "
+                f"ready={stats.get('ready_instance_count', 0)} "
+                f"assignable={stats.get('assignable_instance_count', 0)} "
+                f"busy={stats.get('busy_instance_count', 0)} "
+                f"idle={stats.get('idle_instance_count', 0)} "
+                f"pending={stats.get('pending_instance_count', 0)} "
+                f"per_device={stats.get('instances_per_device', {})}",
+                flush=True,
+            )
+        except Exception as exc:
+            print(f"[pool] stats log error: {exc!r}", flush=True)
 
     def _should_scale_up(self) -> bool:
         if self._shutdown:
             return False
         ready, busy, idle, pending, total = self._busy_ready_idle_counts()
-        if total + pending >= self.max_instances:
+        if total >= self.max_instances:
             return False
         # 扩容冷却：避免 monitor loop 每个 tick 都疯狂 spawn。
         # 注意不要因 pending>0 一票否决——同卡多实例可并行加载，应允许在 cooldown
@@ -1426,7 +1557,7 @@ class MultiProcessOCRPool:
         if device_id is None:
             return
         print(f"[pool] scale up: spawning new worker on npu:{device_id}", flush=True)
-        worker = self._spawn_worker(device_id)
+        worker = self._spawn_worker(device_id, apply_assign_delay=True)
         self._last_scale_up = time.time()
         # 异步等 ready，不阻塞 monitor loop
         threading.Thread(
@@ -1517,14 +1648,32 @@ class MultiProcessOCRPool:
                     return
                 time.sleep(0.1)
 
+    def _stats_loop(self):
+        """固定周期打印池子摘要，不依赖 monitor 扩缩容逻辑。"""
+        while not self._shutdown:
+            try:
+                self._log_pool_stats()
+            except Exception as exc:
+                print(f"[pool] stats loop error: {exc!r}", flush=True)
+            for _ in range(max(1, int(self.stats_log_interval * 10))):
+                if self._shutdown:
+                    return
+                time.sleep(0.1)
+
     # --------- C5 watchdog ---------
 
     def _reap_dead_workers(self):
         """检测进程已退出但还在 self.workers 列表里的项，清理。"""
+        if self._shutdown:
+            return
         with self._workers_lock:
             dead = [w for w in self.workers
                     if not w.get('retiring', False) and not w['process'].is_alive()]
+        if self._shutdown:
+            return
         for w in dead:
+            if self._shutdown:
+                return
             print(f"[pool] watchdog: worker {w['worker_id']} (pid={w['process'].pid}) "
                   f"died unexpectedly, cleaning up", flush=True)
             with self._workers_lock:
@@ -1538,7 +1687,7 @@ class MultiProcessOCRPool:
         if self._shutdown:
             return
         ready, busy, idle, pending, total = self._busy_ready_idle_counts()
-        deficit = self.min_instances - (total + pending)
+        deficit = self.min_instances - total
         if deficit <= 0:
             return
         for _ in range(deficit):
@@ -1547,7 +1696,7 @@ class MultiProcessOCRPool:
                 return
             print(f"[pool] watchdog: respawning to reach min_instances={self.min_instances}, "
                   f"target=npu:{device_id}", flush=True)
-            worker = self._spawn_worker(device_id)
+            worker = self._spawn_worker(device_id, apply_assign_delay=False)
             threading.Thread(
                 target=self._wait_for_workers_ready,
                 args=([worker], self.worker_init_timeout),
@@ -1619,12 +1768,12 @@ async def startup_event():
             # 检测模型参数
             'det_db_thresh': float(os.getenv('OCR_DET_DB_THRESH', '0.12')),
             'det_db_box_thresh': float(os.getenv('OCR_DET_DB_BOX_THRESH', '0.15')),
-            'det_limit_side_len': int(os.getenv('OCR_DET_LIMIT_SIDE_LEN', '960')),
+            'det_limit_side_len': int(os.getenv('OCR_DET_LIMIT_SIDE_LEN', '2560')),
             'det_db_unclip_ratio': float(os.getenv('OCR_DET_DB_UNCLIP_RATIO', '1.8')),
-            'drop_score': float(os.getenv('OCR_DROP_SCORE', '0.5')),
+            'drop_score': float(os.getenv('OCR_DROP_SCORE', '0.0')),
             
             # 识别模型参数
-            'max_text_length': int(os.getenv('OCR_MAX_TEXT_LENGTH', '25')),
+            'max_text_length': int(os.getenv('OCR_MAX_TEXT_LENGTH', '64')),
             'use_space_char': os.getenv('OCR_USE_SPACE_CHAR', 'True').lower() == 'true',
             
             # 分类模型参数
@@ -1642,15 +1791,17 @@ async def startup_event():
         elastic_config = {
             'npu_device_ids': npu_device_ids,
             'min_instances': int(os.getenv('OCR_MIN_INSTANCES', '1')),
-            'max_instances': int(os.getenv('OCR_MAX_INSTANCES', '32')),
-            'per_card_max': int(os.getenv('OCR_PER_CARD_MAX', '0')),
-            'idle_timeout': int(os.getenv('OCR_IDLE_TIMEOUT', '120')),
+            'max_instances': int(os.getenv('OCR_MAX_INSTANCES', '24')),
+            'per_card_max': int(os.getenv('OCR_PER_CARD_MAX', '6')),
+            'idle_timeout': int(os.getenv('OCR_IDLE_TIMEOUT', '600')),
             'scale_cooldown': int(os.getenv('OCR_SCALE_COOLDOWN', '15')),
             'batch_acquire_wait': float(os.getenv('OCR_BATCH_ACQUIRE_WAIT', '8')),
-            'instance_hbm_mb': int(os.getenv('OCR_INSTANCE_HBM_MB', '8000')),
+            'instance_hbm_mb': int(os.getenv('OCR_INSTANCE_HBM_MB', '5500')),
             'hbm_safety_margin_mb': int(os.getenv('OCR_HBM_SAFETY_MARGIN_MB', '4096')),
             'monitor_interval': float(os.getenv('OCR_MONITOR_INTERVAL', '3.0')),
+            'stats_log_interval': float(os.getenv('OCR_STATS_LOG_INTERVAL', '5.0')),
             'worker_init_timeout': float(os.getenv('OCR_WORKER_INIT_TIMEOUT', '300.0')),
+            'worker_assign_delay_sec': float(os.getenv('OCR_WORKER_ASSIGN_DELAY_SEC', '5.0')),
         }
 
         # 使用多进程池：每实例一个独立 OS 进程，支持同卡多实例 + 动态扩缩容
@@ -1664,11 +1815,9 @@ async def startup_event():
             ocr_server = None
             return
 
-        # 紧急回滚开关：OCR_USE_LEGACY_POOL=true 用旧的 ElasticOCRPool（同进程多线程）。
-        # MultiProcessOCRPool 在当前环境下会破坏 FastAPI 的 asyncio event loop（症状是
-        # uvicorn 不再 accept 新连接），原因疑似 multiprocessing context 在父进程留下的
-        # helper 进程/socket。新池根因未定位前，先用旧池保证发版可用。
-        _use_legacy = os.getenv('OCR_USE_LEGACY_POOL', 'true').lower() == 'true'
+        # 回滚开关：仅在显式设置 OCR_USE_LEGACY_POOL=true 时回退到旧的 ElasticOCRPool。
+        # 默认直接使用 MultiProcessOCRPool，目标是支持多卡、多实例、动态扩缩容。
+        _use_legacy = os.getenv('OCR_USE_LEGACY_POOL', 'false').lower() == 'true'
         if _use_legacy:
             print("ℹ️  using legacy ElasticOCRPool (same-process multi-thread). "
                   "Set OCR_USE_LEGACY_POOL=false to try MultiProcessOCRPool.")
@@ -1682,6 +1831,7 @@ async def startup_event():
             # 不能阻塞 asyncio event loop。用 run_in_executor 把它丢到线程池里。
             import asyncio as _asyncio
             loop = _asyncio.get_event_loop()
+            print("ℹ️  using MultiProcessOCRPool (multi-process elastic pool)")
             ocr_server = await loop.run_in_executor(
                 None,
                 lambda: MultiProcessOCRPool(**elastic_config, **ocr_config),
@@ -1693,10 +1843,21 @@ async def startup_event():
         print(f"  - 设备: {ocr_server.device_info}")
         print(f"  - 文本方向分类: {cls_status}")
         print(f"  - Batch配置: 分类=24, 识别=12 (优化模式)")
+        print(f"  - OCR精度参数: det_limit_side_len={ocr_config['det_limit_side_len']}, "
+              f"det_db_thresh={ocr_config['det_db_thresh']}, "
+              f"det_db_box_thresh={ocr_config['det_db_box_thresh']}, "
+              f"drop_score={ocr_config['drop_score']}, "
+              f"max_text_length={ocr_config['max_text_length']}")
         print(f"  - Pool: min={elastic_config['min_instances']}, max={elastic_config['max_instances']}, "
               f"per_card_max={per_card_str}, "
+              f"idle_timeout={elastic_config['idle_timeout']}, "
+              f"worker_assign_delay_sec={elastic_config['worker_assign_delay_sec']}, "
+              f"stats_log_interval={elastic_config['stats_log_interval']}, "
               f"instance_hbm_mb={elastic_config['instance_hbm_mb']}, "
               f"safety_margin_mb={elastic_config['hbm_safety_margin_mb']}")
+
+        if hasattr(ocr_server, 'start_background_threads'):
+            ocr_server.start_background_threads()
         
     except Exception as e:
         print(f"OCR推理服务启动失败: {e}")
@@ -1822,13 +1983,26 @@ async def health_check(probe: int = 0):
 async def get_info():
     """获取服务信息"""
     global ocr_server
-    
+
+    pool_stats = {}
+    if ocr_server is not None and hasattr(ocr_server, 'get_pool_stats'):
+        try:
+            pool_stats = ocr_server.get_pool_stats() or {}
+        except Exception:
+            pool_stats = {}
+
     return InfoResponse(
         service_name="PytorchPaddleOCR 推理服务",
         version="1.0.0",
         device_info=ocr_server.device_info if ocr_server else "unknown",
         supported_formats=["JPG", "JPEG", "PNG", "BMP", "TIFF", "WEBP"],
         max_image_size="10000x10000",
+        task_queue_size=pool_stats.get('task_queue_size', 0),
+        waiting_request_count=pool_stats.get('waiting_request_count', 0),
+        ready_instance_count=pool_stats.get('ready_instance_count', 0),
+        assignable_instance_count=pool_stats.get('assignable_instance_count', 0),
+        busy_instance_count=pool_stats.get('busy_instance_count', 0),
+        idle_instance_count=pool_stats.get('idle_instance_count', 0),
     )
 
 
