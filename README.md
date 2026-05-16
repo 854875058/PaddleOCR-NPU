@@ -112,13 +112,62 @@ python start_server.py \
   --max_text_length 64
 ```
 
+### 运维脚本启动
+
+如果你希望像服务一样后台启动、重启、查看状态和追日志，推荐直接使用仓库内置脚本：
+
+```bash
+# 启动服务（脚本默认端口 6663）
+bash scripts/ocr_service.sh start
+
+# 重启服务
+bash scripts/ocr_service.sh restart
+
+# 查看服务状态
+bash scripts/ocr_service.sh status
+
+# 实时查看日志
+bash scripts/ocr_service.sh logs
+
+# 停止服务
+bash scripts/ocr_service.sh stop
+
+# 强制清理残留进程
+bash scripts/ocr_service.sh purge
+```
+
+脚本特点：
+
+- 使用 `setsid + nohup + disown` 后台启动，退出终端后服务不会被带掉
+- 自动写入 `logs/ocr_service.log` 和 `logs/ocr_service.pid`
+- `restart` 会先尝试按 PID 和进程组优雅停止，再按端口与 cmdline 清理残留进程
+- 当 `ss`、`lsof`、`fuser` 无法解析监听 PID 时，会回退到 `pkill -f "python.*start_server.py"` 做兜底清理
+
+常见自定义启动方式：
+
+```bash
+# 将脚本服务改到 8011 端口，便于和 README 中 API 示例保持一致
+PORT=8011 bash scripts/ocr_service.sh start
+
+# 指定多卡与实例池参数
+PORT=8011 \
+PHYSICAL_NPU_DEVICE_IDS=0,1,2,3 \
+SERVICE_LOCAL_NPU_DEVICE_IDS=0,1,2,3 \
+MIN_INSTANCES=4 \
+MAX_INSTANCES=24 \
+PER_CARD_MAX=6 \
+IDLE_TIMEOUT=600 \
+bash scripts/ocr_service.sh restart
+```
+
 
 
 ## 🌐 API接口
 
 ### 服务信息
 - **默认地址**: `http://localhost:8011`
-- **API文档**: `http://localhost:8011/docs`
+- **脚本默认地址**: `http://localhost:6663`
+- **API文档**: `http://localhost:8011/docs`，脚本默认端口对应 `http://localhost:6663/docs`
 - **支持格式**: JPG, JPEG, PNG
 - **健康检查**: `GET /health`
 - **服务状态**: `GET /info`
@@ -127,6 +176,25 @@ python start_server.py \
 - **文件上传识别**: `POST /ocr/upload`
 
 ### **请求示例**
+
+**常用 curl 检查命令**:
+
+```bash
+# 轻量健康检查：只看 OCR pool 是否 ready
+curl http://127.0.0.1:8011/health
+
+# 深度健康检查：额外触发一次真实 OCR 推理（带 30 秒缓存）
+curl "http://127.0.0.1:8011/health?probe=1"
+
+# 查看服务信息和当前实例池状态
+curl http://127.0.0.1:8011/info
+
+# 查看服务统计信息
+curl http://127.0.0.1:8011/stats
+
+# 如果是用脚本默认端口启动，把 8011 改成 6663 即可
+curl http://127.0.0.1:6663/info
+```
 
 **curl示例**:
 
@@ -139,6 +207,12 @@ curl --request POST \
   --header 'User-Agent: PostmanRuntime-ApipostRuntime/1.1.0' \
   --header 'content-type: multipart/form-data' \
   --form 'file=@/path/to/your/document.jpg'
+```
+
+更简洁的上传测试命令：
+
+```bash
+curl -F "file=@doc/imgs/00006737.jpg" http://127.0.0.1:8011/ocr/upload
 ```
 
 **Python示例**:
