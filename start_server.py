@@ -8,7 +8,38 @@ OCR推理服务启动脚本
 import os
 import sys
 import argparse
+import atexit
+import signal
 import uvicorn
+
+
+class SignalLoggingServer(uvicorn.Server):
+    """Log shutdown signals before delegating to uvicorn's normal handler."""
+
+    def handle_exit(self, sig, frame):
+        sig_name = signal.Signals(sig).name if sig else "UNKNOWN"
+        print(
+            f"[signal] uvicorn received {sig_name}({sig}) "
+            f"pid={os.getpid()} ppid={os.getppid()} pgid={os.getpgrp()}",
+            flush=True,
+        )
+        try:
+            import ocr_server as ocr_server_module
+            pool = getattr(ocr_server_module, "ocr_server", None)
+            if pool is not None and hasattr(pool, "_shutdown"):
+                pool._shutdown = True
+                print("[signal] marked OCR pool shutdown_requested=True", flush=True)
+        except Exception as exc:
+            print(f"[signal] failed to mark OCR pool shutdown: {exc}", flush=True)
+        return super().handle_exit(sig, frame)
+
+
+def log_process_exit():
+    print(
+        f"[signal] start_server exiting pid={os.getpid()} "
+        f"ppid={os.getppid()} pgid={os.getpgrp()}",
+        flush=True,
+    )
 
 
 def parse_args():
@@ -21,18 +52,20 @@ def parse_args():
 
     # OCR基础配置
     parser.add_argument("--disable_angle_cls", action="store_true", help="禁用文本方向分类（默认启用）")
-    parser.add_argument("--npu_device_id", type=int, default=1, help="NPU设备ID")
-    parser.add_argument("--npu_device_ids", type=str, default="1,2,3", help="NPU设备优先级列表，逗号分隔，如 1,2,3")
-    parser.add_argument("--min_instances", type=int, default=1, help="最小常驻实例数")
-    parser.add_argument("--max_instances", type=int, default=32, help="实例池最大实例数（仅作上限护栏；实际由HBM决定）")
-    parser.add_argument("--per_card_max", type=int, default=0, help="单张NPU卡上允许的最大实例数；<=0 表示不限制（仅由HBM决定）")
-    parser.add_argument("--idle_timeout", type=int, default=120, help="实例空闲多久后自动缩容，单位秒")
-    parser.add_argument("--scale_cooldown", type=int, default=15, help="扩容冷却时间，单位秒")
-    parser.add_argument("--batch_acquire_wait", type=float, default=8.0, help="批量请求为等待新实例就绪而额外等待的秒数")
-    parser.add_argument("--instance_hbm_mb", type=int, default=8000, help="估算单个OCR实例占用的HBM，单位MB")
+    parser.add_argument("--npu_device_id", type=int, default=0, help="NPU设备ID")
+    parser.add_argument("--npu_device_ids", type=str, default="0,1,2,3", help="NPU设备优先级列表，逗号分隔，如 0,1,2,3")
+    parser.add_argument("--min_instances", type=int, default=4, help="最小常驻实例数")
+    parser.add_argument("--max_instances", type=int, default=24, help="实例池最大实例数（仅作上限护栏；实际由HBM决定）")
+    parser.add_argument("--per_card_max", type=int, default=6, help="单张NPU卡上允许的最大实例数；<=0 表示不限制（仅由HBM决定）")
+    parser.add_argument("--idle_timeout", type=int, default=600, help="实例空闲多久后自动缩容，单位秒")
+    parser.add_argument("--scale_cooldown", type=int, default=5, help="扩容冷却时间，单位秒")
+    parser.add_argument("--batch_acquire_wait", type=float, default=15.0, help="批量请求为等待新实例就绪而额外等待的秒数")
+    parser.add_argument("--instance_hbm_mb", type=int, default=5500, help="估算单个OCR实例占用的HBM，单位MB")
     parser.add_argument("--hbm_safety_margin_mb", type=int, default=4096, help="每张卡保留的HBM安全余量，单位MB")
     parser.add_argument("--monitor_interval", type=float, default=3.0, help="弹性伸缩监控间隔（秒）")
+    parser.add_argument("--stats_log_interval", type=float, default=5.0, help="池子状态摘要日志输出间隔（秒）")
     parser.add_argument("--worker_init_timeout", type=float, default=300.0, help="单个 worker 初始化超时（秒）")
+    parser.add_argument("--worker_assign_delay_sec", type=float, default=5.0, help="worker ready 后延迟多久才允许分配任务（秒）")
     parser.add_argument("--skip_warmup", action="store_true", help="跳过 worker init 阶段的 dummy 推理预热（调试用）")
     
     # 模型路径配置
@@ -52,12 +85,12 @@ def parse_args():
     # 检测模型参数
     parser.add_argument("--det_db_thresh", type=float, default=0.12, help="检测阈值，越小检测越敏感")
     parser.add_argument("--det_db_box_thresh", type=float, default=0.15, help="边界框阈值")
-    parser.add_argument("--det_limit_side_len", type=int, default=960, help="检测图像边长限制（默认960，1920等更高值会大幅拖慢推理但精度提升有限）")
+    parser.add_argument("--det_limit_side_len", type=int, default=2560, help="检测图像边长限制；水印/小字场景建议保留较高值")
     parser.add_argument("--det_db_unclip_ratio", type=float, default=1.8, help="文本框扩展比例")
-    parser.add_argument("--drop_score", type=float, default=0.5, help="置信度过滤阈值")
+    parser.add_argument("--drop_score", type=float, default=0.0, help="置信度过滤阈值；水印/半透明文本建议不过滤低分候选")
     
     # 识别模型参数
-    parser.add_argument("--max_text_length", type=int, default=25, help="最大文本长度")
+    parser.add_argument("--max_text_length", type=int, default=64, help="最大文本长度")
     parser.add_argument("--use_space_char", action="store_true", default=True, help="是否使用空格字符")
     
     # 分类模型参数
@@ -113,11 +146,16 @@ def print_startup_info(args):
     print("=" * 60)
     print(f"服务地址: http://{args.host}:{args.port}")
     print(f"API文档: http://{args.host}:{args.port}/docs")
+    print(f"[signal] start_server pid={os.getpid()} ppid={os.getppid()} pgid={os.getpgrp()}")
     print(f"配置信息:")
     print(f"  - 处理模式: 同步处理 (简化架构)")
     print(f"  - 计算设备: NPU 弹性实例池")
     print(f"  - 设备优先级: {args.npu_device_ids}")
     print(f"  - Elastic: min={args.min_instances}, max={args.max_instances}, per_card_max={args.per_card_max}, batch_wait={args.batch_acquire_wait}s")
+    print(f"  - OCR精度参数: det_limit_side_len={args.det_limit_side_len}, det_db_thresh={args.det_db_thresh}, "
+          f"det_db_box_thresh={args.det_db_box_thresh}, drop_score={args.drop_score}, max_text_length={args.max_text_length}")
+    print(f"  - Worker assign delay: {args.worker_assign_delay_sec}s")
+    print(f"  - Stats log interval: {args.stats_log_interval}s")
     print(f"  - 文本方向分类: {'启用' if use_angle_cls else '禁用'}")
     if use_angle_cls:
         print(f"  - 分类模型: {args.cls_model_path}")
@@ -126,6 +164,7 @@ def print_startup_info(args):
 
 def main():
     """主函数"""
+    atexit.register(log_process_exit)
     args = parse_args()
 
     # 检查模型文件
@@ -148,7 +187,9 @@ def main():
     os.environ['OCR_INSTANCE_HBM_MB'] = str(args.instance_hbm_mb)
     os.environ['OCR_HBM_SAFETY_MARGIN_MB'] = str(args.hbm_safety_margin_mb)
     os.environ['OCR_MONITOR_INTERVAL'] = str(args.monitor_interval)
+    os.environ['OCR_STATS_LOG_INTERVAL'] = str(args.stats_log_interval)
     os.environ['OCR_WORKER_INIT_TIMEOUT'] = str(args.worker_init_timeout)
+    os.environ['OCR_WORKER_ASSIGN_DELAY_SEC'] = str(args.worker_assign_delay_sec)
     os.environ['OCR_SKIP_WARMUP'] = 'true' if args.skip_warmup else 'false'
     
     # 模型路径配置
@@ -194,7 +235,7 @@ def main():
         from ocr_server import _AccessLogProbeFilter
         logging.getLogger("uvicorn.access").addFilter(_AccessLogProbeFilter())
 
-        uvicorn.run(
+        config = uvicorn.Config(
             "ocr_server:app",
             host=args.host,
             port=args.port,
@@ -203,6 +244,8 @@ def main():
             log_level="info",  # 固定日志级别
             access_log=True  # 启用访问日志
         )
+        server = SignalLoggingServer(config)
+        server.run()
     except KeyboardInterrupt:
         print("\n服务已停止")
     except Exception as e:
