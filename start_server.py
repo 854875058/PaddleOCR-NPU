@@ -13,14 +13,36 @@ import signal
 import uvicorn
 
 
+def _safe_pgid():
+    """Best-effort PGID lookup that also works on Windows."""
+    getpgrp = getattr(os, "getpgrp", None)
+    if callable(getpgrp):
+        try:
+            return getpgrp()
+        except Exception:
+            pass
+
+    getpgid = getattr(os, "getpgid", None)
+    if callable(getpgid):
+        try:
+            return getpgid(0)
+        except Exception:
+            pass
+
+    return "N/A"
+
+
+def _process_identity():
+    return f"pid={os.getpid()} ppid={os.getppid()} pgid={_safe_pgid()}"
+
+
 class SignalLoggingServer(uvicorn.Server):
     """Log shutdown signals before delegating to uvicorn's normal handler."""
 
     def handle_exit(self, sig, frame):
         sig_name = signal.Signals(sig).name if sig else "UNKNOWN"
         print(
-            f"[signal] uvicorn received {sig_name}({sig}) "
-            f"pid={os.getpid()} ppid={os.getppid()} pgid={os.getpgrp()}",
+            f"[signal] uvicorn received {sig_name}({sig}) {_process_identity()}",
             flush=True,
         )
         try:
@@ -36,8 +58,7 @@ class SignalLoggingServer(uvicorn.Server):
 
 def log_process_exit():
     print(
-        f"[signal] start_server exiting pid={os.getpid()} "
-        f"ppid={os.getppid()} pgid={os.getpgrp()}",
+        f"[signal] start_server exiting {_process_identity()}",
         flush=True,
     )
 
@@ -146,7 +167,7 @@ def print_startup_info(args):
     print("=" * 60)
     print(f"服务地址: http://{args.host}:{args.port}")
     print(f"API文档: http://{args.host}:{args.port}/docs")
-    print(f"[signal] start_server pid={os.getpid()} ppid={os.getppid()} pgid={os.getpgrp()}")
+    print(f"[signal] start_server {_process_identity()}")
     print(f"配置信息:")
     print(f"  - 处理模式: 同步处理 (简化架构)")
     print(f"  - 计算设备: NPU 弹性实例池")
