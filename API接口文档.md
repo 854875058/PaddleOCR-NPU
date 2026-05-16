@@ -1,8 +1,8 @@
 # 接口文档
 
 ## 服务信息
-- **服务地址**: `http://192.168.230.3:8011`
-- **API文档**: `http://192.168.230.3:8011/docs`
+- **服务地址**: `http://192.168.230.3:6663`
+- **API文档**: `http://192.168.230.3:6663/docs`
 - **支持格式**: JPG, JPEG, PNG
 
 ## 核心接口
@@ -86,7 +86,7 @@ import base64
 with open("image.jpg", "rb") as f:
     image = base64.b64encode(f.read()).decode()
 
-response = requests.post("http://localhost:8011/ocr/single", json={
+response = requests.post("http://localhost:6663/ocr/single", json={
     "image": image
 })
 
@@ -101,7 +101,7 @@ print(result["result"]["markdown_result"])
 const formData = new FormData();
 formData.append('file', fileInput.files[0]);
 
-fetch('http://localhost:8011/ocr/upload', {
+fetch('http://localhost:6663/ocr/upload', {
     method: 'POST',
     body: formData
 })
@@ -116,7 +116,7 @@ fetch('http://localhost:8011/ocr/upload', {
 
 
 # 单图OCR (Base64)
-curl -X POST "http://localhost:8011/ocr/single" \
+curl -X POST "http://localhost:6663/ocr/single" \
      -H "Content-Type: application/json" \
      -d '{"image": "base64编码的图像数据"}'
 ```

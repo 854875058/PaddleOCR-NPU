@@ -88,11 +88,11 @@ python quick_ocr.py --image_dir doc/imgs/ \
 ### 启动服务
 
 ```bash
-# 基础启动（默认端口8011，所有参数使用默认值）
+# 基础启动（默认端口 6663，所有参数使用默认值）
 python start_server.py
 
 # 自定义端口和地址
-python start_server.py --port 8012
+python start_server.py --port 6664
 
 # 禁用方向分类模型（提升速度，减少显存）
 python start_server.py --disable_angle_cls
@@ -117,7 +117,7 @@ python start_server.py \
 如果你希望像服务一样后台启动、重启、查看状态和追日志，推荐直接使用仓库内置脚本：
 
 ```bash
-# 启动服务（脚本默认端口 6663）
+# 启动服务（默认端口 6663）
 bash scripts/ocr_service.sh start
 
 # 重启服务
@@ -146,11 +146,11 @@ bash scripts/ocr_service.sh purge
 常见自定义启动方式：
 
 ```bash
-# 将脚本服务改到 8011 端口，便于和 README 中 API 示例保持一致
-PORT=8011 bash scripts/ocr_service.sh start
+# 将服务改到其他端口
+PORT=6664 bash scripts/ocr_service.sh start
 
 # 指定多卡与实例池参数
-PORT=8011 \
+PORT=6663 \
 PHYSICAL_NPU_DEVICE_IDS=0,1,2,3 \
 SERVICE_LOCAL_NPU_DEVICE_IDS=0,1,2,3 \
 MIN_INSTANCES=4 \
@@ -165,9 +165,8 @@ bash scripts/ocr_service.sh restart
 ## 🌐 API接口
 
 ### 服务信息
-- **默认地址**: `http://localhost:8011`
-- **脚本默认地址**: `http://localhost:6663`
-- **API文档**: `http://localhost:8011/docs`，脚本默认端口对应 `http://localhost:6663/docs`
+- **默认地址**: `http://localhost:6663`
+- **API文档**: `http://localhost:6663/docs`
 - **支持格式**: JPG, JPEG, PNG
 - **健康检查**: `GET /health`
 - **服务状态**: `GET /info`
@@ -181,26 +180,23 @@ bash scripts/ocr_service.sh restart
 
 ```bash
 # 轻量健康检查：只看 OCR pool 是否 ready
-curl http://127.0.0.1:8011/health
+curl http://127.0.0.1:6663/health
 
 # 深度健康检查：额外触发一次真实 OCR 推理（带 30 秒缓存）
-curl "http://127.0.0.1:8011/health?probe=1"
+curl "http://127.0.0.1:6663/health?probe=1"
 
 # 查看服务信息和当前实例池状态
-curl http://127.0.0.1:8011/info
+curl http://127.0.0.1:6663/info
 
 # 查看服务统计信息
-curl http://127.0.0.1:8011/stats
-
-# 如果是用脚本默认端口启动，把 8011 改成 6663 即可
-curl http://127.0.0.1:6663/info
+curl http://127.0.0.1:6663/stats
 ```
 
 **curl示例**:
 
 ```bash
 curl --request POST \
-  --url http://localhost:8011/ocr/upload \
+  --url http://localhost:6663/ocr/upload \
   --header 'Accept: */*' \
   --header 'Accept-Encoding: gzip, deflate, br' \
   --header 'Connection: keep-alive' \
@@ -212,7 +208,7 @@ curl --request POST \
 更简洁的上传测试命令：
 
 ```bash
-curl -F "file=@doc/imgs/00006737.jpg" http://127.0.0.1:8011/ocr/upload
+curl -F "file=@doc/imgs/00006737.jpg" http://127.0.0.1:6663/ocr/upload
 ```
 
 **Python示例**:
@@ -223,7 +219,7 @@ import base64
 with open("image.jpg", "rb") as f:
     image_data = base64.b64encode(f.read()).decode()
 
-response = requests.post("http://localhost:8011/ocr/single", json={
+response = requests.post("http://localhost:6663/ocr/single", json={
     "image": image_data
 })
 
@@ -239,7 +235,7 @@ print(result["result"]["markdown_result"])
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `--host` | string | `0.0.0.0` | 服务绑定地址，`0.0.0.0`允许外部访问，`127.0.0.1`仅本地访问 |
-| `--port` | int | `8011` | 服务端口号 |
+| `--port` | int | `6663` | 服务端口号 |
 
 ### 🎯 OCR基础配置参数
 | 参数 | 类型 | 默认值 | 说明 |

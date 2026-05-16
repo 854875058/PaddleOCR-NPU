@@ -58,7 +58,7 @@ def call_ocr_api(image_base64, api_type=1):
             'Authorization': 'Basic Og=='
         }
     else:
-        url = "http://192.168.230.3:8011/ocr/single"
+        url = "http://192.168.230.3:6663/ocr/single"
         payload = {
             "image_base64": image_base64,
         }

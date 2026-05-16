@@ -48,7 +48,7 @@ def parse_args():
 
     # 服务配置
     parser.add_argument("--host", type=str, default="0.0.0.0", help="服务绑定地址")
-    parser.add_argument("--port", type=int, default=8011, help="服务端口")
+    parser.add_argument("--port", type=int, default=6663, help="服务端口")
 
     # OCR基础配置
     parser.add_argument("--disable_angle_cls", action="store_true", help="禁用文本方向分类（默认启用）")
