@@ -1,5 +1,26 @@
 # PaddleOCR-NPU
 
+## 多卡多实例动态扩缩容运行证据
+
+本仓库当前 OCR 服务支持 `MultiProcessOCRPool` 多卡多实例动态扩缩容。服务会根据请求压力在多张 NPU 卡上拉起或回收 OCR worker，并通过周期性 `pool stats` 日志输出当前实例分布、空闲实例、忙碌实例和初始化中的实例。
+
+关键默认配置：
+
+- `npu_devices=0,1,2,3`
+- `min_instances=4`
+- `max_instances=24`
+- `per_card_max=6`
+- `idle_timeout=600`，空闲 10 分钟后开始缩容
+- `scale_cooldown=5`
+- `batch_acquire_wait=15`
+- `worker_assign_delay_sec=5`
+
+以下截图是实际运行中的多卡多实例状态。日志里的 `ready=18 assignable=18 busy=0 idle=18 pending=1 per_device={'0': 5, '1': 5, '2': 4, '3': 4}` 说明 OCR worker 已经动态扩展到 18 个实例，并分布在 4 张 NPU 卡上；请求压力消失后，空闲 worker 会按 `idle_timeout=600` 的策略逐步缩容。
+
+![多卡多实例动态扩缩容运行日志 1](./QQ20260516-223832.png)
+
+![多卡多实例动态扩缩容运行日志 2](./QQ20260516-223904.png)
+
 [![NPU](https://img.shields.io/badge/NPU-昇腾-orange)](https://www.hiascend.com/) [![OCR](https://img.shields.io/badge/OCR-PaddleOCR-blue)](https://github.com/PaddlePaddle/PaddleOCR) [![License](https://img.shields.io/badge/License-Apache%202.0-yellow)](LICENSE)
 
 ## 🚀 项目简介
