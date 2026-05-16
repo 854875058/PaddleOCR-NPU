@@ -27,15 +27,23 @@ fi
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-6663}"
 PHYSICAL_NPU_DEVICE_IDS="${PHYSICAL_NPU_DEVICE_IDS:-0,1,2,3}"
-SERVICE_LOCAL_NPU_DEVICE_IDS="${SERVICE_LOCAL_NPU_DEVICE_IDS:-1,2,3}"
-MIN_INSTANCES="${MIN_INSTANCES:-1}"
-MAX_INSTANCES="${MAX_INSTANCES:-32}"
-PER_CARD_MAX="${PER_CARD_MAX:-0}"
-IDLE_TIMEOUT="${IDLE_TIMEOUT:-120}"
-SCALE_COOLDOWN="${SCALE_COOLDOWN:-20}"
-BATCH_ACQUIRE_WAIT="${BATCH_ACQUIRE_WAIT:-6}"
-INSTANCE_HBM_MB="${INSTANCE_HBM_MB:-8000}"
-HBM_SAFETY_MARGIN_MB="${HBM_SAFETY_MARGIN_MB:-6144}"
+SERVICE_LOCAL_NPU_DEVICE_IDS="${SERVICE_LOCAL_NPU_DEVICE_IDS:-0,1,2,3}"
+MIN_INSTANCES="${MIN_INSTANCES:-4}"
+MAX_INSTANCES="${MAX_INSTANCES:-24}"
+PER_CARD_MAX="${PER_CARD_MAX:-6}"
+IDLE_TIMEOUT="${IDLE_TIMEOUT:-600}"
+SCALE_COOLDOWN="${SCALE_COOLDOWN:-5}"
+BATCH_ACQUIRE_WAIT="${BATCH_ACQUIRE_WAIT:-15}"
+INSTANCE_HBM_MB="${INSTANCE_HBM_MB:-5500}"
+HBM_SAFETY_MARGIN_MB="${HBM_SAFETY_MARGIN_MB:-4096}"
+WORKER_ASSIGN_DELAY_SEC="${WORKER_ASSIGN_DELAY_SEC:-5}"
+STATS_LOG_INTERVAL="${STATS_LOG_INTERVAL:-5}"
+DET_LIMIT_SIDE_LEN="${DET_LIMIT_SIDE_LEN:-2560}"
+DET_DB_THRESH="${DET_DB_THRESH:-0.12}"
+DET_DB_BOX_THRESH="${DET_DB_BOX_THRESH:-0.15}"
+DET_DB_UNCLIP_RATIO="${DET_DB_UNCLIP_RATIO:-1.8}"
+DROP_SCORE="${DROP_SCORE:-0.0}"
+MAX_TEXT_LENGTH="${MAX_TEXT_LENGTH:-64}"
 LOG_DIR="${LOG_DIR:-$ROOT_DIR/logs}"
 LOG_FILE="${LOG_FILE:-$LOG_DIR/ocr_service.log}"
 PID_FILE="${PID_FILE:-$LOG_DIR/ocr_service.pid}"
@@ -118,6 +126,26 @@ wait_for_port_release() {
     sleep "$delay"
   done
   return 1
+}
+
+kill_process_group() {
+  local pid="$1"
+  local signal="${2:-TERM}"
+  [ -n "$pid" ] || return 0
+  if ! kill -0 "$pid" 2>/dev/null; then
+    return 0
+  fi
+  # 服务通过 setsid 启动，主 PID 通常就是独立进程组的 PGID。
+  # 优先按整个进程组发信号，避免 multiprocessing worker 残留。
+  echo "Sending SIG$signal to process group -$pid and pid $pid"
+  kill "-$signal" -- "-$pid" 2>/dev/null || true
+  kill "-$signal" "$pid" 2>/dev/null || true
+}
+
+kill_paddle_python_fallback() {
+  echo "Fallback cleanup: killing python processes matching 'paddle' (excluding 'funasr')"
+  ps aux | grep python | grep paddle | grep -v funasr | grep -v grep || true
+  ps aux | grep python | grep paddle | grep -v funasr | grep -v grep | awk '{print $2}' | xargs -r kill -9
 }
 
 stop_port_processes() {
@@ -230,8 +258,15 @@ start_service() {
   echo "  idle_timeout=$IDLE_TIMEOUT"
   echo "  scale_cooldown=$SCALE_COOLDOWN"
   echo "  batch_acquire_wait=$BATCH_ACQUIRE_WAIT"
+  echo "  worker_assign_delay_sec=$WORKER_ASSIGN_DELAY_SEC"
+  echo "  stats_log_interval=$STATS_LOG_INTERVAL"
   echo "  instance_hbm_mb=$INSTANCE_HBM_MB"
   echo "  hbm_safety_margin_mb=$HBM_SAFETY_MARGIN_MB"
+  echo "  det_limit_side_len=$DET_LIMIT_SIDE_LEN"
+  echo "  det_db_thresh=$DET_DB_THRESH"
+  echo "  det_db_box_thresh=$DET_DB_BOX_THRESH"
+  echo "  drop_score=$DROP_SCORE"
+  echo "  max_text_length=$MAX_TEXT_LENGTH"
   echo "  log_file=$LOG_FILE"
   echo "  pid_file=$PID_FILE"
 
@@ -247,8 +282,16 @@ start_service() {
     --idle_timeout "$IDLE_TIMEOUT" \
     --scale_cooldown "$SCALE_COOLDOWN" \
     --batch_acquire_wait "$BATCH_ACQUIRE_WAIT" \
+    --worker_assign_delay_sec "$WORKER_ASSIGN_DELAY_SEC" \
+    --stats_log_interval "$STATS_LOG_INTERVAL" \
     --instance_hbm_mb "$INSTANCE_HBM_MB" \
     --hbm_safety_margin_mb "$HBM_SAFETY_MARGIN_MB" \
+    --det_limit_side_len "$DET_LIMIT_SIDE_LEN" \
+    --det_db_thresh "$DET_DB_THRESH" \
+    --det_db_box_thresh "$DET_DB_BOX_THRESH" \
+    --det_db_unclip_ratio "$DET_DB_UNCLIP_RATIO" \
+    --drop_score "$DROP_SCORE" \
+    --max_text_length "$MAX_TEXT_LENGTH" \
     > "$LOG_FILE" 2>&1 < /dev/null &
 
   local new_pid=$!
@@ -267,7 +310,7 @@ stop_service() {
 
   if [ -n "$pid" ] && is_pid_running "$pid"; then
     echo "Sending SIGTERM to PID=$pid"
-    kill "$pid" 2>/dev/null || true
+    kill_process_group "$pid" TERM
     # 等到 PID 退出或最多 10 秒
     local i
     for ((i=0; i<20; i++)); do
@@ -276,7 +319,7 @@ stop_service() {
     done
     if is_pid_running "$pid"; then
       echo "PID=$pid still alive after 10s, sending SIGKILL"
-      kill -9 "$pid" 2>/dev/null || true
+      kill_process_group "$pid" KILL
     fi
   else
     echo "No tracked OCR service PID; will rely on cmdline scan"
@@ -287,14 +330,26 @@ stop_service() {
     stop_port_processes || true
   fi
 
+  if port_in_use; then
+    kill_paddle_python_fallback || true
+    sleep 1
+  fi
+
   rm -f "$PID_FILE"
   echo "Stop complete."
 }
 
 purge_service() {
   echo "Force purge: killing all start_server.py / ocr_server uvicorn processes"
+  local pid
+  pid="$(read_pid)"
+  if [ -n "$pid" ] && is_pid_running "$pid"; then
+    kill_process_group "$pid" KILL
+    sleep 1
+  fi
   pkill -9 -f "python.*start_server\.py" 2>/dev/null || true
   pkill -9 -f "uvicorn.*ocr_server" 2>/dev/null || true
+  kill_paddle_python_fallback || true
   sleep 1
   rm -f "$PID_FILE"
   echo "Purge complete."
@@ -316,6 +371,11 @@ status_service() {
 restart_service() {
   stop_service || true
   sleep 1
+  if port_in_use; then
+    echo "Port $PORT still in use after stop; escalating to purge"
+    purge_service || true
+    sleep 1
+  fi
   start_service
 }
 
